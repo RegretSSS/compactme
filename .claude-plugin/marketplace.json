@@ -1,0 +1,16 @@
+{
+  "name": "local",
+  "version": "0.2.1",
+  "description": "Local plugin marketplace: plugins developed in-house, sourced directly from git working tree",
+  "owner": {
+    "name": "remedy"
+  },
+  "plugins": [
+    {
+      "name": "compactme",
+      "source": "./",
+      "category": "productivity",
+      "description": "Model-initiated self-compact: injects /compact + a wakeup word carrying task-reconstruction clues back into the same session"
+    }
+  ]
+}

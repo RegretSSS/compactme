@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "compactme": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/compactme_mcp.py"]
+    }
+  }
+}
