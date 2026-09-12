@@ -1,17 +1,30 @@
 # compactme
 
-让模型给自己发 `/compact`：v2 为**事件驱动两段注入**——MCP 工具只写任务并 fork
-一个 per-pane watcher，watcher 确认屏幕出现 `⎿ Compacted` 特征串后，才把唤醒词
-动态注入（post-compact 动态注入）。
+让模型给自己发 `/compact`：v0.2.4 为**事件驱动两段注入 + ❯ 判据投递协议**——MCP 工具
+只写任务并 fork 一个 per-pane watcher，watcher 确认屏幕出现 `⎿ Compacted` 特征串后，
+才把唤醒词动态注入（post-compact 动态注入），并用 ❯ 用户消息形态验证**真正发送成功**。
 
 ```
 compactme() ──写 task.json──▶ watcher（独立进程，每 pane 一个，多实体互不冲突）
                                 │ WAIT_SETTLE  等模型写完收尾总结（默认 6s）
-                                │ INJECTING    C-u → /compact 文本 → 1.5s → Enter（分键防抖）
+                                │ INJECTING    BSpace 清框 → /compact 文本 → 落地确认 → Enter
                                 │ WATCHING     轮询 capture-pane（只读快照，无换页冲突）：
-                                │                Compacting → 等；⎿ Compacted → 注入唤醒词
+                                │                Compacting → 等；⎿ Compacted → 投递唤醒词
                                 │                esc to interrupt → 被吞了，停下重试（≤2）
-                                │ 兜底          超时仍注入唤醒词（含重建线索，晚到无损）
+                                │ 兜底          超时仍投递唤醒词（含重建线索，晚到无损）
+
+deliver_wakeup 可靠投递（v0.2.4，三轮生产事故的教训）：
+  成功判据 = ❯ 用户消息形态（字节级实测）：输入框行是 ❯+nbsp(\xa0)，
+  已提交用户消息是 ❯+普通空格——「文本在框」vs「已发出」由此可靠区分，
+  不依赖行区域划分（压缩刚完成时消息流只有几行，新消息会落进底部窗口）。
+  最后一条 ❯+空格消息含唤醒词开头、非 /compact 前缀（compact_cmd 残留
+  内嵌唤醒词全文，v0.2.2 两次 already-sent 误判漏发的形态，靠前缀排除）。
+  busy 不作成功信号：压缩后模型自动继续也会 busy，误判即假 DONE 漏发。
+  BSpace×1200 清框（C-u 实测无清行语义）→ 注入 → 落地确认 → Enter → 等 ❯ 判据
+  判据未中且文本仍在框（Enter 被吞）→ 只补 Enter（幂等，不重发文本）
+  落地失败（忙期不收输入/文本被吞）→ dump 屏幕底部留痕 + 轮前退避 0/3/8s，
+  共 3 轮（跨过压缩后 TUI 摘要渲染忙期——pane %2 FAILED 事故根因）
+  三轮仍失败 → state=FAILED 落盘（不假 DONE），watcher.log 全程留痕
 ```
 
 单发 `/compact` 只会让新上下文停在待机态；唤醒词是恢复任务的唯一保证，因此工具会**硬校验**唤醒词必须包含重建线索（文件路径、TaskList 等），不合格直接拒绝执行。
@@ -23,9 +36,14 @@ compactme/
 ├── .claude-plugin/plugin.json   # 插件清单
 ├── .mcp.json                    # MCP server 注册
 ├── mcp/compactme_mcp.py         # compactme() + context_stats()（状态栏水位解析）
-├── mcp/watcher.py               # 事件驱动注入状态机（per-pane 独立进程）
+├── mcp/watcher.py               # 事件驱动注入状态机 + deliver_wakeup 投递协议
 ├── skills/compact-me/SKILL.md   # 可用时机与唤醒词纪律
-└── tests/fake_claude.py         # 模拟 TUI 的端到端测试靶
+├── tests/test_deliver_wakeup.py # 投递协议单元测试（13 路径：happy/吞Enter/吞文本/
+│                                #   残留回归/渲染滞后/无busy/全失败/清框纯净/
+│                                #   判据直测×5——nbsp 区分/单行框/窗口错位）
+├── tests/fake_claude.py         # 模拟 TUI 的 e2e 靶（raw 输入+折行渲染+❯nbsp/空格
+│                                #   双形态+BSpace 删字+底部锚定布局）
+└── tests/e2e.sh                 # e2e 四模式：normal/swallow/eat_enter/lost_text
 ```
 
 ## 安装
