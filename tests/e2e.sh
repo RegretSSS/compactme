@@ -2,7 +2,7 @@
 # e2e.sh — 在真实 tmux pane 里对 fake_claude 跑完整 watcher 流程。
 #
 # 用法: tests/e2e.sh [mode]
-#   mode: normal(默认) | swallow | eat_enter | lost_text
+#   mode: normal(默认) | swallow | eat_enter | lost_text | paste_collapse
 #
 # 链路全真：真实 tmux send-keys / capture-pane / 独立 watcher 进程，
 # fake_claude 只替代 Claude Code 本体（保真点见其 docstring）。
@@ -60,6 +60,7 @@ FAIL=0
 [ "$N_WAKE" -eq 1 ] || { echo "❌ 唤醒词 $N_WAKE 次（应为 1，防重复）"; FAIL=1; }
 case "$MODE" in
   normal|eat_enter) [ "$N_COMPACT" -eq 1 ] || { echo "❌ compact $N_COMPACT 次（应 1）"; FAIL=1; } ;;
+  paste_collapse) [ "$N_COMPACT" -eq 1 ] || { echo "❌ compact $N_COMPACT 次（应 1）"; FAIL=1; } ;;
   swallow|lost_text) [ "$N_COMPACT" -ge 1 ] && [ "$N_COMPACT" -le 3 ] || { echo "❌ compact $N_COMPACT 次（应 1-3）"; FAIL=1; } ;;
 esac
 [ "$FAIL" = 0 ] && echo "✅ e2e[$MODE] PASS"

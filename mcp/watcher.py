@@ -17,7 +17,7 @@
   COMPACTING   已确认压缩进行中。唯一出路：看到 Compacted → 投递唤醒词；
                或全局超时 → 兜底投递唤醒词。绝不重注 /compact（防双杀）。
 
-deliver_wakeup 可靠投递协议（v0.2.4，三轮迭代的教训）：
+deliver_wakeup 可靠投递协议（v0.2.5，四轮迭代的教训）：
   成功信号 = ❯ 用户消息判据（2026-09-12 用户观察「用户发言灰底渲染」的程序化）：
   消息流区**最后一条 ❯ 开头的行**包含唤醒词开头片段、且不是 /compact 命令。
   compact_cmd 残留也是 ❯ 用户消息且内嵌唤醒词全文（v0.2.2 两次 already-sent
@@ -29,19 +29,32 @@ deliver_wakeup 可靠投递协议（v0.2.4，三轮迭代的教训）：
   1. BSpace 轰炸清框 → 注入文本 → 轮询等尾部片段出现在输入区（落地确认，
      ≤3s）。C-u 在 Claude Code 无清行语义（实测注入 727 字符后 C-u 原样
      不动），BSpace 逐字符删、空框无操作，幂等。
-  2. 发 Enter → 轮询 ❯ 判据（≤3s）
-  3. 判据未命中且尾部仍在输入区（Enter 被吞）→ 只补 Enter（≤3 次）
-  4. 落地失败（文本被吞，或压缩后 TUI 忙期不收输入——2026-09-12 pane %2
+  2. 折叠态处理（v0.2.5，2026-09-13 pane %2 FAILED 事故）：压缩后模型继续
+     busy 时注入的大块文本被 Claude Code 按 paste 处理，渲染为
+     [Pasted text #N] 折叠占位符（dump 留痕铁证：三轮注入编号 #7/#8/#9
+     递增——文本全部到达，明文永不上屏，tail 判据恒假）。
+     主路：检测到折叠 → 再注入一次同样文本（模拟「再粘贴一次」，官方
+     paste again to expand 行为，用户实测两次 ctrl+v 取消折叠）→ blob
+     展开为明文 → 走正常 Enter → ❯ 判据。
+     兜底：展开失败 → 直接对折叠 blob 发 Enter（用户手动 Enter 验证过
+     折叠态可提交），提交成功判据 = 展开提示消失 + 出现编号大于注入前
+     最大值的新 [Pasted text #N] 消息行（历史粘贴消息编号不递增，不误判）。
+  3. 发 Enter → 轮询 ❯ 判据（≤3s）
+  4. 判据未命中且尾部仍在输入区（Enter 被吞/排队）→ 只补 Enter（≤3 次）
+  5. 每轮注入前先复查上轮是否已延迟成功——busy 期 Enter 会被 TUI 排队，
+     模型忙完才提交渲染（提交晚于轮内验证窗口），不复查会重注双发
+  6. 落地失败（文本被吞，或压缩后 TUI 忙期不收输入——2026-09-12 pane %2
      FAILED 事故：Compacted+1s 注入、两轮间隔仅 0.5s 全撞在摘要渲染忙期，
      实证 idle 后同长度注入 0.15s 即落地）→ dump 屏幕底部进日志 + 轮前
      退避 (0, 3, 8)s 跨过忙期，共 3 轮
-  5. 三轮仍失败 → state=FAILED 落盘（不假 DONE），日志全程留痕
+  7. 三轮仍失败 → state=FAILED 落盘（不假 DONE），日志全程留痕
   注：不做「进入时已发送」幂等跳过——重入防重复由 kill_previous 保证；
   幂等检查在 compact 残留屏幕上必然误判（v0.2.2 教训），误判漏发比罕见
   重发（多发一条唤醒词，无害）代价高得多。
 """
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -60,6 +73,11 @@ MARK_BUSY = "esc to interrupt"
 MARK_USER_MSG = "❯ "     # 已提交用户消息行前缀
 MARK_INPUT = "❯\xa0"     # 输入框行前缀
 MARK_COMPACT_CMD = "/compact"  # compact 命令前缀（残留排除用）
+# 折叠 paste 形态（v0.2.5）：busy 期注入的大块文本被折叠为 [Pasted text #N]
+# 占位符。`paste again to expand` 提示只在**输入框当前持有**折叠 paste 时显示
+# （消息流里历史粘贴的 [Pasted text #N] 消息不伴随提示），是折叠态的主判据。
+MARK_PASTE_HINT = "paste again to expand"
+RE_PASTE_BLOB = re.compile(r"\[Pasted text #(\d+)\]")
 
 POLL_INTERVAL = 0.4
 START_TIMEOUT = 20  # 等 Compacting 出现的窗口（秒）
@@ -70,6 +88,7 @@ IDLE_POLL = 1.0
 INPUT_AREA_LINES = 4
 
 DELIVER_TEXT_TIMEOUT = 3.0    # 等注入文本落地输入区
+EXPAND_TEXT_TIMEOUT = 3.0     # 折叠态二次注入（展开）后等明文落地
 DELIVER_SENT_TIMEOUT = 3.0    # 等发送成功信号（❯ 消息判据）
 DELIVER_RECHECK = 1.5         # 补 Enter 失败后的延迟复检（渲染滞后容忍）
 DELIVER_BACKOFF = (0.0, 3.0, 8.0)  # 各轮注入前退避：跨过压缩后 TUI 忙期
@@ -208,6 +227,47 @@ def sent_signal(frame: str, head: str, tail: str) -> bool:
     return head in line and not body.lstrip().startswith(MARK_COMPACT_CMD)
 
 
+def deliver_state(frame: str, tail: str) -> str | None:
+    """注入文本在输入框的形态：'text' 明文在框 / 'collapsed' 折叠 paste 在框 /
+    None 未落地。折叠判定用 paste 展开提示（全屏匹配）——tail 明文在折叠态
+    不上屏，in_input 永假，必须分流专门处理。"""
+    if in_input(frame, tail):
+        return "text"
+    if MARK_PASTE_HINT in frame:
+        return "collapsed"
+    return None
+
+
+def max_paste_id(frame: str) -> int:
+    """屏幕上最大的 [Pasted text #N] 编号（无则 0）。注入前记录作基线，
+    提交判据只认编号大于基线的新 blob——历史粘贴消息编号不递增，不误判。"""
+    return max((int(m.group(1)) for m in RE_PASTE_BLOB.finditer(frame)), default=0)
+
+
+def collapsed_sent(frame: str, prev_max: int) -> bool:
+    """折叠 paste 已提交：展开提示消失 + 出现编号 > prev_max 的新 blob 消息行。
+
+    预览态必有提示相伴；提示消失说明输入框已清空、blob 转为已提交消息
+    （2026-09-13 pane %2 FAILED 后用户手动 Enter 验证过折叠态可直接提交）。
+    blob 行须是 ❯ 用户消息形态（消息流正式渲染），输入框里的不算。"""
+    if MARK_PASTE_HINT in frame:
+        return False
+    for line in frame.split("\n"):
+        if not line.lstrip().startswith(MARK_USER_MSG):
+            continue
+        if any(int(m.group(1)) > prev_max for m in RE_PASTE_BLOB.finditer(line)):
+            return True
+    return False
+
+
+def text_in_box(frame: str, tail: str, collapsed_mode: bool) -> bool:
+    """文本仍在输入框（⇔ 尚未提交）——nudge 补 Enter 的依据。折叠态下明文
+    不上屏，改用「展开提示仍在屏」：blob 未提交则提示必然还在。"""
+    if collapsed_mode:
+        return MARK_PASTE_HINT in frame
+    return in_input(frame, tail)
+
+
 def in_input(frame: str, tail: str) -> bool:
     """tail 是否仍在输入框（⇔ 尚未提交）。
 
@@ -230,38 +290,67 @@ def dump_bottom(task: Task, pane: str) -> None:
 
 
 def deliver_wakeup(task: Task, reason: str) -> bool:
-    """投递唤醒词：注入 → 落地确认 → Enter → 验证 → 分级补救。见模块 docstring。"""
+    """投递唤醒词：注入 → 落地确认（明文/折叠分流）→ Enter → 验证 → 分级补救。
+    见模块 docstring。"""
     pane = task.cfg["pane"]
     word = task.cfg["wakeup_word"]
     head, tail = wakeup_markers(word)
 
+    # 入口基线：屏上已有的 blob（折叠提交的 /compact 命令——paste_collapse
+    # 全链路下 compact_cmd 同样被折叠，编号 ≤ 基线）不参与「唤醒词已送达」
+    # 判定，轮前复查只认本函数注入产生的新 blob（e2e paste_collapse 抓出的
+    # 假 DONE：blob#1=compact 提交被误判为唤醒词已送达）
+    prev_max = max_paste_id(capture(pane))
     for rnd in range(1, DELIVER_ROUNDS + 1):
         time.sleep(DELIVER_BACKOFF[rnd - 1])  # 轮前退避：跨过压缩后 TUI 忙期
+        # 轮前复查：上轮 Enter 可能被 busy 排队、模型忙完才提交渲染（晚于
+        # 上轮验证窗口）——不复查会重注双发
+        frame = capture(pane)
+        if sent_signal(frame, head, tail) or collapsed_sent(frame, prev_max):
+            task.update(state="DONE", end_reason=f"{reason} (delayed confirm)")
+            task.log(f"wakeup delivered by pre-round check (round {rnd}, {reason})")
+            return True
+
         task.update(state="DELIVERING", wakeup_round=rnd)
+        prev_max = max_paste_id(capture(pane))
         clear_input(pane)
         send_text(pane, word)
-        landed = wait_until(lambda: in_input(capture(pane), tail), DELIVER_TEXT_TIMEOUT, 0.15)
-        task.log(f"wakeup round {rnd}: text landed={landed}")
-        if not landed:
+        state = wait_until(lambda: deliver_state(capture(pane), tail), DELIVER_TEXT_TIMEOUT, 0.15)
+        task.log(f"wakeup round {rnd}: text state={state}")
+        if state == "collapsed":
+            # 折叠主路：再注入一次模拟「再粘贴一次」（paste again to expand，
+            # 用户实测两次 ctrl+v 取消折叠）→ blob 展开为明文走正常判据
+            task.log(f"wakeup round {rnd}: paste collapsed, re-send to expand")
+            send_text(pane, word)
+            state = wait_until(lambda: deliver_state(capture(pane), tail), EXPAND_TEXT_TIMEOUT, 0.15)
+            task.log(f"wakeup round {rnd}: after expand, state={state}")
+        if state is None:
             dump_bottom(task, pane)  # 文本被吞或忙期不收输入 → 留痕后退避重试
             continue
 
+        collapsed_mode = state == "collapsed"  # 展开失败：走折叠提交兜底
+
+        def confirm_sent(frame: str) -> bool:
+            if sent_signal(frame, head, tail):
+                return True
+            return collapsed_mode and collapsed_sent(frame, prev_max)
+
         send_key(pane, "Enter")
-        ok = wait_until(lambda: sent_signal(capture(pane), head, tail), DELIVER_SENT_TIMEOUT, 0.2)
+        ok = wait_until(lambda: confirm_sent(capture(pane)), DELIVER_SENT_TIMEOUT, 0.2)
         task.log(f"wakeup round {rnd}: after enter, sent={ok}")
         if ok:
             task.update(state="DONE", end_reason=reason)
             task.log(f"wakeup delivered ({reason})")
             return True
 
-        # 分级补救：文本仍在输入区（Enter 被吞）→ 只补 Enter（幂等，不重发文本）
+        # 分级补救：文本仍在输入框（Enter 被吞/排队）→ 只补 Enter（幂等，不重发文本）
         for nudge in range(1, ENTER_NUDGES + 1):
             frame = capture(pane)
-            if sent_signal(frame, head, tail):
+            if confirm_sent(frame):
                 task.update(state="DONE", end_reason=reason)
                 task.log(f"wakeup delivered after nudge {nudge} ({reason})")
                 return True
-            if in_input(frame, tail):
+            if text_in_box(frame, tail, collapsed_mode):
                 task.log(f"wakeup enter nudge {nudge} (text still in input)")
                 send_key(pane, "Enter")
                 time.sleep(0.8)
@@ -270,7 +359,7 @@ def deliver_wakeup(task: Task, reason: str) -> bool:
 
         # 渲染滞后容忍：❯ 消息行可能晚于 Enter 数百毫秒出现
         time.sleep(DELIVER_RECHECK)
-        if sent_signal(capture(pane), head, tail):
+        if confirm_sent(capture(pane)):
             task.update(state="DONE", end_reason=f"{reason} (late render confirm)")
             task.log(f"wakeup delivered by late-render confirm ({reason})")
             return True

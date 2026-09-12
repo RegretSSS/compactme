@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """deliver_wakeup 可靠投递协议的单元测试（mock 屏幕 + 按键记录）。
 
-v0.2.4 判据：成功 = 消息流最后一条 ❯ 用户消息含唤醒词 head 且非 /compact
+v0.2.5 判据：成功 = 消息流最后一条 ❯ 用户消息含唤醒词 head 且非 /compact
 前缀，且 tail 不在输入区（文本在框 ⇔ 尚未提交的守卫）。busy 不再是成功信号。
+折叠 paste 态（v0.2.5，2026-09-13 pane %2 生产事故）：busy 期大块注入被折叠为
+[Pasted text #N] 占位符、明文不上屏 → 二次注入展开；展开失败则直接提交 blob，
+以「提示消失 + 编号递增的 blob 消息行」判成功。
 
 覆盖路径：
   1. happy        注入落地 → Enter → ❯ 消息出现 → 一次成功
@@ -18,7 +21,13 @@ v0.2.4 判据：成功 = 消息流最后一条 ❯ 用户消息含唤醒词 head
                   压缩后模型自动继续也会 busy，busy 不能作成功信号）
   7. all_fail     三轮全失败 → state=FAILED（不假 DONE）
   8. prefill      输入框有残留脏文本 → 注入前 BSpace 清框，提交内容纯净
-  9-11. 判据直测  sent_signal 三形态：新消息命中 / 残留排除 / tail 守卫
+  9. paste_expand 回归（v0.2.5 生产事故）：注入被折叠 → 二次注入展开明文 →
+                  正常 Enter → ❯ 判据成功
+  10. paste_submit 展开失败（永远折叠）→ blob 直接 Enter 提交（用户手动
+                  验证过的救法）→ collapsed_sent 编号判据成功
+  11. delayed     round1 的 Enter 排队、提交渲染晚于轮内全部验证窗口 →
+                  round2 轮前复查命中 → 不重注（防双发）
+  12-15. 判据直测 sent_signal 三形态 + collapsed_sent 三形态
 
 确定性策略：time.sleep 置 no-op、wait_until 单次求值——capture 消耗帧队列，
 路径完全可推演，无真实时间依赖。
@@ -39,6 +48,16 @@ WORD = "[续任务：批B开工] 去哪读：memory/MEMORY.md 与 project_deploy
 HEAD, TAIL = watcher.wakeup_markers(WORD)
 FILLER = "\n".join(f"chat history line {i:03d}" for i in range(30))
 INPUT_ONE_LINE = 40  # 输入框一行容量（超过即折行：首行溢出到消息流区）
+
+
+def frame_of_collapsed(blob_seq: int, chat_lines: list[str] | None = None) -> str:
+    """折叠 paste 帧形态（仿 2026-09-13 pane %2 FAILED 现场 dump）：
+    blob 预览行（上下分隔线）+ 状态行 + paste again to expand 提示 + 空行 +
+    空输入框——明文 tail 不上屏，仅提示可判折叠。"""
+    chat = list(chat_lines or [])
+    chat += ["─" * 40, f"❯ [Pasted text #{blob_seq}]", "─" * 40]
+    bottom = ["  status line", "  paste again to expand", "", "❯\xa0"]
+    return "\n".join([FILLER] + chat + bottom)
 
 
 def frame_of(input_text: str = "", chat_lines: list[str] | None = None, busy: bool = False) -> str:
@@ -71,19 +90,26 @@ class FakeScreen:
                         复现 v0.2.2 生产事故的屏幕形态）
       prefill         : 输入框预置残留脏文本（测 BSpace 清框）
       no_busy         : 提交后不渲染 busy（测 ❯ 判据独立于 busy）
+      paste_collapse  : "expand"=大块注入折叠为 blob，再注入一次展开为明文
+                        （paste again to expand）；"never"=永远折叠（测兜底
+                        提交）。None=不折叠（正常路径）
     """
 
     def __init__(self, drop_first_text=False, eat_first_enter=False, compact_residual=False,
-                 prefill="", no_busy=False):
+                 prefill="", no_busy=False, paste_collapse=None):
         self.drop_first_text = drop_first_text
         self.eat_first_enter = eat_first_enter
         self.no_busy = no_busy
+        self.paste_collapse = paste_collapse
         self.text_count = 0
         self.enter_count = 0
         self.input = prefill
         self.busy = False
         self.submitted = []   # 提交的原文（断言清框纯净用）
         self.messages = []    # 已提交的 ❯ 用户消息（渲染进消息流）
+        self.collapsed = False
+        self.pending = ""     # 折叠 blob 持有的原文
+        self.blob_seq = 0     # paste 编号（会话级递增计数器）
         self.residual = (
             [f"❯ /compact 保留任务状态（压缩完成后将收到唤醒词：{WORD}）"]
             if compact_residual else []
@@ -92,6 +118,8 @@ class FakeScreen:
     def frame(self) -> str:
         # residual（压缩前的旧消息）在上，新提交的 ❯ 消息渲染在其下方——
         # 真实屏幕时序，last_user_line 由此才能取到最新用户消息
+        if self.collapsed:
+            return frame_of_collapsed(self.blob_seq, self.residual + self.messages)
         return frame_of(self.input, self.residual + self.messages, self.busy)
 
     def bs(self, n: int) -> None:
@@ -101,6 +129,18 @@ class FakeScreen:
         self.text_count += 1
         if self.drop_first_text and self.text_count == 1:
             return  # 文本被 TUI 重绘吞掉：不回显
+        if self.paste_collapse and len(text) > INPUT_ONE_LINE:
+            # 大块瞬时文本 → Claude Code 按 paste 处理折叠为 blob（明文不上屏）
+            if self.collapsed and self.paste_collapse == "expand":
+                # 再粘贴一次 → 展开：blob 转明文（两份拼接，语义无害）
+                self.input = self.pending + text
+                self.pending = ""
+                self.collapsed = False
+            else:
+                self.collapsed = True
+                self.blob_seq += 1
+                self.pending = text
+            return
         self.input = text
 
     def send_key(self, pane, key):
@@ -113,6 +153,16 @@ class FakeScreen:
             self.enter_count += 1
             if self.eat_first_enter and self.enter_count == 1:
                 return  # Enter 被吞：文本滞留输入区
+            if self.collapsed:
+                # 折叠 blob 直接提交（2026-09-13 pane %2 用户手动 Enter 验证）：
+                # 消息流渲染为折叠形态消息行，提示消失
+                self.submitted.append(self.pending)
+                self.messages.append(f"❯ [Pasted text #{self.blob_seq}]")
+                self.pending = ""
+                self.collapsed = False
+                if not self.no_busy:
+                    self.busy = True
+                return
             if not self.input:
                 return  # 空框 Enter：无操作
             self.submitted.append(self.input)
@@ -214,17 +264,21 @@ def test_late_render_no_reinject(monkeypatch, tmp_path):
     不重注，延迟复检期判据出现 → DONE。
 
     帧队列按 deliver_wakeup 的 capture 顺序精确驱动：
-      ① 落地确认（文本在输入区，折行首行溢出到消息流）
-      ② Enter 后 sent 验证（中间帧）
-      ③ nudge 首查（中间帧 → tail 不在输入区 → break 出 nudge）
-      ④ 延迟复检（❯ 新消息已渲染）
+      ⓪ 入口基线扫描 ① 轮前复查（不命中） ② prev_max 扫描
+      ③ 落地确认（文本在输入区，折行首行溢出到消息流）
+      ④ Enter 后 sent 验证（中间帧）
+      ⑤ nudge 首查（中间帧 → tail 不在输入区 → break 出 nudge）
+      ⑥ 延迟复检（❯ 新消息已渲染）
     """
     screen = FakeScreen(compact_residual=True)
     frames = [
-        frame_of(input_text=WORD),                          # ① 落地确认
-        frame_of(chat_lines=["  ⎿ Compacted (ctrl+o"]),     # ② 中间帧
-        frame_of(chat_lines=["  ⎿ Compacted (ctrl+o"]),     # ③ 中间帧
-        frame_of(chat_lines=["❯ " + WORD]),                 # ④ 新消息已渲染
+        frame_of(),                                          # ⓪ 入口基线扫描
+        frame_of(chat_lines=["  ⎿ Compacted (ctrl+o"]),     # ① 轮前复查：不命中
+        frame_of(),                                          # ② prev_max 扫描
+        frame_of(input_text=WORD),                           # ③ 落地确认
+        frame_of(chat_lines=["  ⎿ Compacted (ctrl+o"]),     # ④ sent 验证：中间帧
+        frame_of(chat_lines=["  ⎿ Compacted (ctrl+o"]),     # ⑤ nudge 首查：中间帧
+        frame_of(chat_lines=["❯ " + WORD]),                 # ⑥ 新消息已渲染
     ]
     ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen, frames=frames)
     assert ok and cfg["state"] == "DONE"
@@ -262,6 +316,66 @@ def test_clears_prefill_before_inject(monkeypatch, tmp_path):
     assert screen.submitted == [WORD]     # 提交的恰是纯唤醒词
 
 
+def test_paste_collapse_expand_path(monkeypatch, tmp_path):
+    """回归（v0.2.5 pane %2 生产事故）：busy 期注入被折叠为 [Pasted text #N]
+    blob（明文不上屏）→ 二次注入模拟「再粘贴一次」展开为明文 → 正常
+    Enter → ❯ 判据成功。"""
+    screen = FakeScreen(paste_collapse="expand")
+    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen)
+    assert ok and cfg["state"] == "DONE"
+    assert rec.text_calls == 2            # 注入 + 展开性重发
+    assert rec.enter_calls == 1
+    log = (tmp_path / "watcher.log").read_text()
+    assert "paste collapsed, re-send to expand" in log
+    assert screen.submitted == [WORD + WORD]  # 展开为两份拼接（语义无害）
+
+
+def test_paste_collapse_submit_fallback(monkeypatch, tmp_path):
+    """展开失败（永远折叠）→ 折叠 blob 直接 Enter 提交（用户 2026-09-13 手动
+    Enter 验证过的救法）→ collapsed_sent 编号判据成功。"""
+    screen = FakeScreen(paste_collapse="never")
+    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen)
+    assert ok and cfg["state"] == "DONE"
+    assert rec.text_calls == 2            # 注入 + 展开尝试（未生效）
+    assert rec.enter_calls == 1
+    log = (tmp_path / "watcher.log").read_text()
+    assert "paste collapsed, re-send to expand" in log
+    assert screen.submitted == [WORD]     # blob 持有的完整唤醒词被提交
+
+
+def test_delayed_submit_recovered_pre_round(monkeypatch, tmp_path):
+    """round1 的 Enter 被 busy 排队：提交渲染晚于轮内全部验证窗口；
+    round2 退避后轮前复查命中 → 不重注（防双发）。"""
+    screen = FakeScreen()
+    frames = [
+        frame_of(),                                      # ⓪ 入口基线扫描
+        frame_of(),                                      # ① r1 轮前复查：不命中
+        frame_of(),                                      # ② r1 prev_max 扫描
+        frame_of(input_text=WORD),                       # ③ r1 落地确认
+        frame_of(),                                      # ④ r1 sent 验证：无新消息
+        frame_of(),                                      # ⑤ r1 nudge 首查 → break
+        frame_of(),                                      # ⑥ r1 late recheck：False
+        frame_of(chat_lines=["❯ " + WORD]),             # ⑦ r2 轮前复查：命中
+    ]
+    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen, frames=frames)
+    assert ok and cfg["state"] == "DONE"
+    assert "delayed confirm" in cfg["end_reason"]
+    assert rec.text_calls == 1            # 未重注（上轮已成功，只是渲染晚）
+    assert rec.enter_calls == 1
+
+
+def test_entry_compact_blob_no_false_done(monkeypatch, tmp_path):
+    """入口屏幕已有折叠提交的 compact blob 消息行（paste_collapse 全链路：
+    compact_cmd 同样被折叠提交）→ round1 轮前复查不得把它误判为唤醒词已
+    送达（假 DONE，e2e 实战抓出）——须走正常折叠展开路径投递。"""
+    screen = FakeScreen(paste_collapse="expand")
+    screen.messages.append("❯ [Pasted text #1]")   # compact blob 已提交
+    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen)
+    assert ok and cfg["state"] == "DONE"
+    assert rec.text_calls == 2            # 走折叠展开路径，不是复查短路
+    assert "delayed confirm" not in cfg["end_reason"]
+
+
 # ---- sent_signal 判据直测（不跑完整投递流程）----
 
 def test_sent_signal_ignores_compact_residual():
@@ -290,6 +404,24 @@ def test_in_input_single_line_box():
     assert watcher.in_input(frame, "试 tail")
     frame2 = frame_of(input_text="[短] 测试 tail")           # nbsp 前缀命中
     assert watcher.in_input(frame2, "[短]")
+
+
+def test_collapsed_sent_forms():
+    """collapsed_sent 三形态：预览态（提示在屏）不算提交；提交态（提示消失 +
+    编号递增的 blob 消息行）算；历史 blob（编号 ≤ 基线）不算。"""
+    preview = frame_of_collapsed(blob_seq=7)
+    assert not watcher.collapsed_sent(preview, 6)      # 预览态：提示在屏
+    submitted = frame_of(chat_lines=["❯ [Pasted text #7]"])
+    assert watcher.collapsed_sent(submitted, 6)        # 新编号 blob 消息行
+    assert not watcher.collapsed_sent(submitted, 7)    # 历史 blob：编号不递增
+
+
+def test_deliver_state_collapsed():
+    """折叠态分流：明文不上屏但提示在屏 → 'collapsed'（tail 判据永假，
+    必须走专门路径）。"""
+    assert watcher.deliver_state(frame_of_collapsed(blob_seq=1), TAIL) == "collapsed"
+    assert watcher.deliver_state(frame_of(input_text=WORD), TAIL) == "text"
+    assert watcher.deliver_state(frame_of(), TAIL) is None
 
 
 def test_window_shift_message_row_not_in_input():

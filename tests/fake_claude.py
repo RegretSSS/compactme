@@ -15,6 +15,11 @@ v3（配合 watcher v0.2.4 ❯ 判据）：按 2026-09-12 pane %2 实测的真�
             第 2 个起正常压缩——测 watcher 的等-idle-重试路径
   eat_enter 第 1 个 Enter 被吞（文本滞留输入框）——测补 Enter 幂等路径
   lost_text 第 1 段注入文本被重绘吞掉（不回显不进框）——测退避重注路径
+  paste_collapse 大块文本段（>100 字符）折叠为 [Pasted text #N] 占位符 +
+            paste again to expand 提示（明文不上屏——2026-09-13 pane %2 生产
+            事故形态）；再次大块到达 → 展开为明文（两次拼接）；Enter 对折叠
+            blob 直接提交（提交内容记录 RECV，消息流渲染折叠形态行）——
+            测 watcher 的折叠识别/二次注入展开/兜底提交三路径
 
 保真要点：
 - alternate screen + ANSI 清屏整帧重绘（旧行/busy 标记在下一次渲染消失）
@@ -49,6 +54,10 @@ busy = False
 enter_count = 0
 text_seg_count = 0
 swallowed = 0
+# 折叠 paste 态（paste_collapse 模式）
+collapsed = False
+pending = ""       # 折叠 blob 持有的原文（提交语义用）
+blob_seq = 0       # paste 编号（会话级递增）
 
 # 进 alternate screen buffer（真 TUI 的做法）：清屏不产生 scrollback，
 # capture-pane 只能看到当前帧，与 Claude Code 的真实渲染语义一致
@@ -79,6 +88,15 @@ def render():
         lines += fold(row, WIDTH)
     if busy:
         lines.append("  (esc to interrupt while thinking…)")
+    if collapsed:
+        # 折叠 paste 预览（仿 2026-09-13 pane %2 dump）：blob 预览行（上下
+        # 分隔线）+ 状态行 + 展开提示 + 空行 + 输入框——明文不上屏
+        lines.append("─" * 30)
+        lines.append(f"❯ [Pasted text #{blob_seq}]")
+        lines.append("─" * 30)
+        lines.append("  fake@localhost · status")
+        lines.append("  paste again to expand")
+        lines.append("")
     # 输入框行 = ❯ + nbsp（真 TUI 字节级形态，空框/有文本/折行首行同形态；
     # 已提交消息才是 ❯ + 普通空格——watcher 靠这两态区分「在框」vs「已发出」）
     lines += fold("❯\xa0" + input_buf, WIDTH)
@@ -89,12 +107,14 @@ def render():
     print("\033[2J\033[H" + "\n".join(lines), end="", flush=True)
 
 
-def handle_submit(line: str):
+def handle_submit(line: str, paste_seq: int | None = None):
+    """paste_seq 非 None = 折叠 blob 提交：内容仍是完整原文（RECV 记录），
+    消息流渲染为折叠形态行（真 TUI 行为）。"""
     global busy, swallowed
     LOG.write(f"RECV|{time.strftime('%H:%M:%S')}|{line}\n")
     # 真 TUI 把用户命令渲染为 ❯ 前缀消息行（含 compact_cmd 内嵌的唤醒词全文，
     # 压缩完成后仍留在屏幕上——v0.2.2 生产事故的屏幕形态，e2e 必须复现）
-    screen.append(f"❯ {line}")
+    screen.append(f"❯ [Pasted text #{paste_seq}]" if paste_seq else f"❯ {line}")
     render()
     if line.startswith("/compact") and not (MODE == "swallow" and swallowed == 0):
         screen.append("  ✶ Compacting conversation…")
@@ -137,12 +157,28 @@ while True:
             text_seg_count += 1
             if MODE == "lost_text" and text_seg_count == 1:
                 pass  # 文本段被 TUI 重绘吞掉：不回显不进框
+            elif MODE == "paste_collapse" and len(part) > 100:
+                # 大块瞬时文本 → 按 paste 处理折叠为 blob（明文不上屏）
+                if collapsed:
+                    # 再粘贴一次 → 展开（paste again to expand）：两份拼接
+                    input_buf = pending + part
+                    pending = ""
+                    collapsed = False
+                else:
+                    collapsed = True
+                    blob_seq += 1
+                    pending = part
             else:
                 input_buf += part
         if idx < len(parts) - 1:  # 本段后有 \r
             enter_count += 1
             if MODE == "eat_enter" and enter_count == 1:
                 pass  # Enter 被吞：文本滞留输入框
+            elif collapsed:
+                # 折叠 blob 直接提交（2026-09-13 pane %2 用户手动 Enter 验证）
+                collapsed = False
+                line, pending = pending, ""
+                handle_submit(line, paste_seq=blob_seq)
             elif input_buf.strip():
                 line, input_buf = input_buf, ""
                 handle_submit(line)
