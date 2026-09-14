@@ -44,6 +44,8 @@ _SPEC = importlib.util.spec_from_file_location(
 watcher = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(watcher)
 
+_REAL_WAIT_UNTIL = watcher.wait_until  # fast_time mock 前保存真实实现
+
 WORD = "[续任务：批B开工] 去哪读：memory/MEMORY.md 与 project_deploy-8ca3617-20260910.md。怎么续：启动批B workflow 四步。"
 HEAD, TAIL = watcher.wakeup_markers(WORD)
 FILLER = "\n".join(f"chat history line {i:03d}" for i in range(30))
@@ -422,6 +424,41 @@ def test_deliver_state_collapsed():
     assert watcher.deliver_state(frame_of_collapsed(blob_seq=1), TAIL) == "collapsed"
     assert watcher.deliver_state(frame_of(input_text=WORD), TAIL) == "text"
     assert watcher.deliver_state(frame_of(), TAIL) is None
+
+
+def test_wait_until_returns_pred_value(monkeypatch):
+    """wait_until 直测（真实实现，不受 fast_time mock）：必须返回 pred()
+    真实返回值而非布尔——2026-09-13 真实试用抓出 v0.2.5 mock 失真：循环内
+    `return True` 把 deliver_state 三态布尔化，`state == "collapsed"` 在
+    生产永不匹配，折叠展开主路成死代码；单测 mock 恰返回 pred() 值，
+    语义失真未被测试网拦住。"""
+    monkeypatch.setattr(watcher, "wait_until", _REAL_WAIT_UNTIL)
+    monkeypatch.setattr(watcher.time, "sleep", lambda s: None)
+    # 首圈命中：返回谓词值本身（"collapsed"/"text"），不是 True
+    assert watcher.wait_until(lambda: "collapsed", 1.0, 0.01) == "collapsed"
+    assert watcher.wait_until(lambda: "text", 1.0, 0.01) == "text"
+    # 谓词恒假：超时返回最后一次谓词值（None），同样不被布尔化成 False
+    ticks = iter([0.0, 100.0])  # deadline=1.0；首查 0<1 进循环体，复查 100≥1 退出
+    monkeypatch.setattr(watcher.time, "time", lambda: next(ticks))
+    assert watcher.wait_until(lambda: None, 1.0, 0.01) is None
+
+
+def test_wrapped_message_tail_row_not_in_input():
+    """v0.2.6 e2e（120 宽 pane）抓出的潜伏漏洞：提交消息折行续行（无前缀、
+    含 tail）落进底部窗口且在空输入框 ❯\xa0 行上方——旧判据「无前缀+
+    含 tail」把它误当输入框内容 → sent 永假 → 三轮重发双发（179 宽下
+    唤醒词恰好单行不折行，漏洞被宽度巧合掩盖，WSL 重启后 pane 变 120
+    宽才暴露）。tail 行在提示符上方不得算在框。"""
+    frame = "\n".join([
+        "  ⎿ Compacted (ctrl+o",
+        f"❯ {WORD}",
+        WORD[-30:],                                # 提交消息的折行续行：无前缀、含 tail
+        "  (esc to interrupt while thinking…)",
+        "❯\xa0",                                   # 空输入框（提交后框已清空）
+        "─ status ─",
+    ])
+    assert not watcher.in_input(frame, TAIL)
+    assert watcher.sent_signal(frame, HEAD, TAIL)
 
 
 def test_window_shift_message_row_not_in_input():

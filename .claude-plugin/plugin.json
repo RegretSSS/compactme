@@ -1,6 +1,6 @@
 {
   "name": "compactme",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Model-initiated self-compact: injects /compact + a wakeup word carrying task-reconstruction clues back into the same session",
   "author": {
     "name": "remedy"

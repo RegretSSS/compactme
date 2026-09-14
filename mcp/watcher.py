@@ -150,12 +150,19 @@ def split_screen(frame: str) -> tuple[str, str]:
     return "\n".join(lines[:-INPUT_AREA_LINES]), "\n".join(lines[-INPUT_AREA_LINES:])
 
 
-def wait_until(pred, timeout: float, interval: float = 0.2) -> bool:
-    """轮询等谓词为真；超时后最后再验一次（边界帧竞态容忍）。"""
+def wait_until(pred, timeout: float, interval: float = 0.2):
+    """轮询等谓词为真；超时后最后再验一次（边界帧竞态容忍）。
+
+    返回使谓词命中的 pred() 真实返回值（如 deliver_state 的
+    'text'/'collapsed' 三态），非布尔——2026-09-13 真实试用抓出 v0.2.5
+    缺陷：循环内 `return True` 把三态布尔化，`state == "collapsed"` 在
+    生产永不匹配，折叠展开主路成死代码（单测 mock 恰返回 pred() 值，
+    语义失真未被测试网拦住）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if pred():
-            return True
+        result = pred()
+        if result:
+            return result
         time.sleep(interval)
     return pred()
 
@@ -271,11 +278,23 @@ def text_in_box(frame: str, tail: str, collapsed_mode: bool) -> bool:
 def in_input(frame: str, tail: str) -> bool:
     """tail 是否仍在输入框（⇔ 尚未提交）。
 
-    tail 所在行是输入框行（❯+nbsp 前缀，或折行后无前缀的续行）才算在框；
-    ❯+普通空格的行是已提交的用户消息——消息流内容少时（压缩刚完成只有
-    摘要几行）新消息会落进底部 N 行窗口，按区域+裸子串判定会把它误当
-    「文本在框」，sent 判据被永假拦截 → FAILED + 三轮重注双发。"""
-    for line in split_screen(frame)[1].split("\n"):
+    输入框的标志行是 ❯+nbsp 前缀（唯一提示符行），折行溢出在其**下方**
+    （长文本时首行被推入消息流区、tail 恒在末行——始终在 ❯\xa0 行之下）；
+    已提交消息是 ❯+普通空格前缀，其折行渲染行无前缀且位于空输入框
+    ❯\xa0 行**上方**——消息落进底部 N 行窗口时（消息流内容少：压缩刚
+    完成只有摘要几行）按「无前缀+含 tail」会把它误当输入框内容
+    （v0.2.6 e2e 在 120 宽 pane 抓出：sent 判据被永假拦截 → 三轮重发
+    双发；179 宽下唤醒词恰好单行不折行，漏洞被宽度巧合掩盖）。
+    故：窗口内有 ❯\xa0 行时，tail 所在行必须在其下方或同行；窗口内
+    没有（输入区扩展出窗口的长文本落地态）则退回行级判定。"""
+    lines = split_screen(frame)[1].split("\n")
+    box_start = None  # 输入框提示符行（❯+nbsp）在窗口内的位置
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(MARK_INPUT):
+            box_start = i
+    for i, line in enumerate(lines):
+        if box_start is not None and i < box_start:
+            continue  # 提示符上方：消息流渲染行（含提交消息的折行续行）
         if tail in line and not line.lstrip().startswith(MARK_USER_MSG):
             return True
     return False

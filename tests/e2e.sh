@@ -60,7 +60,11 @@ FAIL=0
 [ "$N_WAKE" -eq 1 ] || { echo "❌ 唤醒词 $N_WAKE 次（应为 1，防重复）"; FAIL=1; }
 case "$MODE" in
   normal|eat_enter) [ "$N_COMPACT" -eq 1 ] || { echo "❌ compact $N_COMPACT 次（应 1）"; FAIL=1; } ;;
-  paste_collapse) [ "$N_COMPACT" -eq 1 ] || { echo "❌ compact $N_COMPACT 次（应 1）"; FAIL=1; } ;;
+  paste_collapse)
+    [ "$N_COMPACT" -eq 1 ] || { echo "❌ compact $N_COMPACT 次（应 1）"; FAIL=1; }
+    # v0.2.6：锁主路——必须走「折叠→二次展开→明文 Enter」而非意外兜底提交
+    grep -q "paste collapsed, re-send to expand" "$RUN/watcher.log" || { echo "❌ 未走折叠展开主路"; FAIL=1; }
+    [ "$END_REASON" = "compacted confirmed" ] || { echo "❌ reason=$END_REASON（主路一轮即中，非 delayed/兜底）"; FAIL=1; } ;;
   swallow|lost_text) [ "$N_COMPACT" -ge 1 ] && [ "$N_COMPACT" -le 3 ] || { echo "❌ compact $N_COMPACT 次（应 1-3）"; FAIL=1; } ;;
 esac
 [ "$FAIL" = 0 ] && echo "✅ e2e[$MODE] PASS"
