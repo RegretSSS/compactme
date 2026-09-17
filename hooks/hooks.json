@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 '${CLAUDE_PLUGIN_ROOT}/hooks/compact_hook.py'",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/compact_hook.py",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 '${CLAUDE_PLUGIN_ROOT}/hooks/compact_hook.py'",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/compact_hook.py",
             "timeout": 10
           }
         ]
