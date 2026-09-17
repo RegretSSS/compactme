@@ -1,100 +1,64 @@
 #!/usr/bin/env python3
-"""compactme watcher — 事件驱动的注入状态机（每 pane 一个实例，互不干扰）。
+"""compactme watcher v0.3 — hooks + transcript 双通道信号源。
 
 由 compactme_mcp.py fork，读 /tmp/compactme/<pane>/task.json，只盯自己的 pane。
-所有屏幕检测用 tmux capture-pane（只读内存快照，无换页、无锁、并发安全）。
+注入动作走 tmux send-keys；**全部状态确认不再看屏幕**——v0.2.x 四次生产
+事故全是屏幕形态问题（折叠→折行→窗口→布局，2026-09-13/09-17，见 VERIFY），
+2026-09-17 pane %3（backend）双发 /compact + 唤醒词空转事故后整体换轨：
 
-状态机（v0.2.2，唤醒词投递可靠性改造）：
-  WAIT_SETTLE  等 TUI 回到输入态（模型写完收尾总结）
-  INJECTING    C-u 清行 → /compact 文本 → 等文本落地屏幕输入区（落地确认替代
-               固定延迟）→ 单独 Enter
-  AWAIT_START  只认 "Compacting conversation"/▰ 为压缩已开始。
-               防陈旧误判：屏幕残留上次 compact 的 "⎿ Compacted" 不算数——
-               LLM 摘要必然持续数秒，Compacting 特征串必现，未见到它之前
-               Compacted 一律不接受。
-               若先看到 "esc to interrupt" → /compact 被当普通消息吞掉：
-               轮询等 busy 标记消失（真 idle）再重试，不盲等固定秒数。
-  COMPACTING   已确认压缩进行中。唯一出路：看到 Compacted → 投递唤醒词；
-               或全局超时 → 兜底投递唤醒词。绝不重注 /compact（防双杀）。
+  compacting 开始 = PreCompact hook 标记（插件 hooks/hooks.json 注册，
+                   hooks/compact_hook.py 写 /tmp/compactme/hooks/<sid>.pre.json）
+  compacted 完成 = PostCompact hook 标记；兜底 = transcript isCompactSummary
+  唤醒词送达    = transcript 新增 user 条目含 head 且非 /compact 前缀
 
-deliver_wakeup 可靠投递协议（v0.2.5，四轮迭代的教训）：
-  成功信号 = ❯ 用户消息判据（2026-09-12 用户观察「用户发言灰底渲染」的程序化）：
-  消息流区**最后一条 ❯ 开头的行**包含唤醒词开头片段、且不是 /compact 命令。
-  compact_cmd 残留也是 ❯ 用户消息且内嵌唤醒词全文（v0.2.2 两次 already-sent
-  误判漏发的屏幕形态），靠「/compact 前缀排除」精确封堵；输入框折行时首行
-  （含 ❯ 与 head）可能落进消息流区，靠「tail 仍在输入区 ⇔ 尚未提交」核心
-  不变量守卫。v0.2.3 的 busy 信号退役：压缩后模型自动继续也会 busy，误判
-  成功即假 DONE 漏发；❯ 消息是提交本身的直接证据，且先于 busy 渲染。
-  流程：
-  1. BSpace 轰炸清框 → 注入文本 → 轮询等尾部片段出现在输入区（落地确认，
-     ≤3s）。C-u 在 Claude Code 无清行语义（实测注入 727 字符后 C-u 原样
-     不动），BSpace 逐字符删、空框无操作，幂等。
-  2. 折叠态处理（v0.2.5，2026-09-13 pane %2 FAILED 事故）：压缩后模型继续
-     busy 时注入的大块文本被 Claude Code 按 paste 处理，渲染为
-     [Pasted text #N] 折叠占位符（dump 留痕铁证：三轮注入编号 #7/#8/#9
-     递增——文本全部到达，明文永不上屏，tail 判据恒假）。
-     主路：检测到折叠 → 再注入一次同样文本（模拟「再粘贴一次」，官方
-     paste again to expand 行为，用户实测两次 ctrl+v 取消折叠）→ blob
-     展开为明文 → 走正常 Enter → ❯ 判据。
-     兜底：展开失败 → 直接对折叠 blob 发 Enter（用户手动 Enter 验证过
-     折叠态可提交），提交成功判据 = 展开提示消失 + 出现编号大于注入前
-     最大值的新 [Pasted text #N] 消息行（历史粘贴消息编号不递增，不误判）。
-  3. 发 Enter → 轮询 ❯ 判据（≤3s）
-  4. 判据未命中且尾部仍在输入区（Enter 被吞/排队）→ 只补 Enter（≤3 次）
-  5. 每轮注入前先复查上轮是否已延迟成功——busy 期 Enter 会被 TUI 排队，
-     模型忙完才提交渲染（提交晚于轮内验证窗口），不复查会重注双发
-  6. 落地失败（文本被吞，或压缩后 TUI 忙期不收输入——2026-09-12 pane %2
-     FAILED 事故：Compacted+1s 注入、两轮间隔仅 0.5s 全撞在摘要渲染忙期，
-     实证 idle 后同长度注入 0.15s 即落地）→ dump 屏幕底部进日志 + 轮前
-     退避 (0, 3, 8)s 跨过忙期，共 3 轮
-  7. 三轮仍失败 → state=FAILED 落盘（不假 DONE），日志全程留痕
-  注：不做「进入时已发送」幂等跳过——重入防重复由 kill_previous 保证；
-  幂等检查在 compact 残留屏幕上必然误判（v0.2.2 教训），误判漏发比罕见
-  重发（多发一条唤醒词，无害）代价高得多。
+transcript 优势（2026-09-17 事故 transcript 铁证）：写入先于 TUI 渲染 10s+；
+折叠 paste 提交后记录完整原文（屏幕只显 [Pasted text #N]）——屏幕雷区全免疫。
+
+状态机：
+  WAIT_SETTLE 等 TUI 回到输入态（模型写完收尾总结）
+  INJECTING  清框 → /compact 文本 + 0.3s + Enter → 等 PreCompact 标记
+             （PRECOMPACT_TIMEOUT=90s 覆盖 busy 期输入排队——/compact 进
+             队列没丢，21s 等屏幕特征误判重发是 v0.2.x 双发根源）。
+             无标记才重试：swallow（被当普通消息吞）时 PreCompact 不触发，
+             自然落入重试，不再需要 busy 屏幕判定。
+  COMPACTING 等 PostCompact 标记或 transcript isCompactSummary。绝不重注。
+  DELIVERING 清框 → 唤醒词 + 0.3s + Enter 连发 → tail transcript 等新增
+             user 条目含 head。注入前行数做基线，历史条目不参与判定
+             （compact_cmd 条目内嵌唤醒词全文，靠 /compact 前缀排除；
+              isCompactSummary 摘要可能复述唤醒词，显式跳过）。
+             轮前复查上轮延迟提交（busy 排队的 Enter 忙完才提交）；
+             三轮退避重注，失败 dump 屏幕留痕 + FAILED 落盘（不假 DONE）。
+
+注入+Enter 直发的形态覆盖（不再需要落地确认/折叠分流）：
+  idle     文本进框 → Enter 提交
+  busy     两者都进输入队列 → 忙完按序处理 → 提交（Enter 排队延迟，
+           transcript 条目最终出现，轮前复查/长验证窗兜住）
+  折叠     文本折叠为 blob → Enter 直接提交 blob（用户手动验证过的路径，
+           transcript 记完整原文）
+  文本被吞 Enter 提交空框（无害）→ transcript 无新条目 → 重注
 """
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-# 屏幕特征串（子串匹配，容错空格/修饰）
-MARK_COMPACTING = "Compacting conversation"
-MARK_COMPACTED = "Compacted (ctrl+o"
-MARK_BUSY = "esc to interrupt"
-# ❯ 的两种形态（2026-09-12 pane %2/%3 实测字节级验证）：
-# 输入框行 = ❯ + nbsp(\xa0)，空框/有文本/折行首行同形态；
-# 已提交用户消息 = ❯ + 普通空格。这是「文本在框」vs「已发出」的可靠区分，
-# 不依赖行区域划分——消息流内容少时（压缩刚完成）新消息行会落进底部
-# N 行窗口，按区域判分必错。
-MARK_USER_MSG = "❯ "     # 已提交用户消息行前缀
-MARK_INPUT = "❯\xa0"     # 输入框行前缀
-MARK_COMPACT_CMD = "/compact"  # compact 命令前缀（残留排除用）
-# 折叠 paste 形态（v0.2.5）：busy 期注入的大块文本被折叠为 [Pasted text #N]
-# 占位符。`paste again to expand` 提示只在**输入框当前持有**折叠 paste 时显示
-# （消息流里历史粘贴的 [Pasted text #N] 消息不伴随提示），是折叠态的主判据。
-MARK_PASTE_HINT = "paste again to expand"
-RE_PASTE_BLOB = re.compile(r"\[Pasted text #(\d+)\]")
+HOOK_ROOT = Path(os.environ.get("COMPACTME_HOOK_ROOT", "/tmp/compactme/hooks"))
+# transcript 根目录可被测试环境覆盖（e2e/单测用隔离目录，不碰真实会话记录）
+PROJECTS_ROOT = Path(os.environ.get(
+    "COMPACTME_PROJECTS_ROOT", str(Path.home() / ".claude" / "projects")))
+MARK_COMPACT_CMD = "/compact"  # compact 命令条目前缀（transcript 残留排除）
 
-POLL_INTERVAL = 0.4
-START_TIMEOUT = 20  # 等 Compacting 出现的窗口（秒）
-IDLE_POLL = 1.0
-
-# 屏幕底部 N 行视为输入区（Claude Code：输入框末行 + 边框 + 状态行）。
-# 长文本折行时输入框占多行，但 tail 恒在末行——仍在窗口内（实测验证）。
-INPUT_AREA_LINES = 4
-
-DELIVER_TEXT_TIMEOUT = 3.0    # 等注入文本落地输入区
-EXPAND_TEXT_TIMEOUT = 3.0     # 折叠态二次注入（展开）后等明文落地
-DELIVER_SENT_TIMEOUT = 3.0    # 等发送成功信号（❯ 消息判据）
-DELIVER_RECHECK = 1.5         # 补 Enter 失败后的延迟复检（渲染滞后容忍）
-DELIVER_BACKOFF = (0.0, 3.0, 8.0)  # 各轮注入前退避：跨过压缩后 TUI 忙期
+POLL_INTERVAL = 0.5
+PRECOMPACT_TIMEOUT = 90    # 等 PreCompact 标记：覆盖 busy 期 /compact 输入排队
+COMPACT_DONE_TIMEOUT = 240 # 等 PostCompact：大上下文摘要生成可达分钟级
+DELIVER_SENT_TIMEOUT = 30  # 等唤醒词 transcript 条目：覆盖 busy 排队提交
+DELIVER_BACKOFF = (0.0, 3.0, 8.0)  # 各轮注入前退避
 DELIVER_ROUNDS = len(DELIVER_BACKOFF)
-ENTER_NUDGES = 3              # 补 Enter 次数上限
-CLEAR_BS = 1200               # 清框 BSpace 数：唤醒词实测 1036 字符，宁多勿少
+CLEAR_BS = 1200            # 清框 BSpace 数：唤醒词实测 1036 字符，宁多勿少
+KEY_TEXT_SETTLE = 0.3      # 注入文本与 Enter 之间的间隔（防乱序）
 
 
 def tmux(*args: str) -> str:
@@ -112,9 +76,7 @@ def pane_alive(pane: str) -> bool:
 
 
 def capture(pane: str) -> str:
-    # 只抓当前屏幕（-S 0），不含 scrollback：
-    # TUI 整屏重绘时旧帧可能残留在 scrollback（如 \033[2J 清屏会把旧行
-    # 拷入 history），特征串匹配必须只看当前帧，否则陈旧行会污染状态判断。
+    # 只抓当前屏幕（-S 0），失败留痕诊断用（v0.3 不参与任何状态判定）
     return tmux("capture-pane", "-p", "-t", pane, "-S", "0")
 
 
@@ -130,34 +92,16 @@ def clear_input(pane: str) -> None:
     """清空输入框：BSpace 逐字符删，空框无操作（幂等）。
 
     C-u 在 Claude Code 无清行语义（2026-09-12 实测：注入 727 字符后发 C-u
-    原样不动，最终 BSpace×800 删净）——旧版用 C-u 清框碰巧一直框是空的才
-    没暴露。残留不清会把唤醒词拼接污染成脏消息发出。"""
+    原样不动，最终 BSpace×800 删净）。残留不清会把唤醒词拼接污染成脏消息发出。"""
     tmux("send-keys", "-t", pane, *(["BSpace"] * CLEAR_BS))
     time.sleep(0.3)
 
 
-def split_screen(frame: str) -> tuple[str, str]:
-    """返回 (消息流区, 输入区)。行数不足时输入区=全屏，消息流区=空。
-
-    只去掉尾换行的 split artifact，保留真实空行——rstrip 会把屏幕底部的
-    真实空行吃掉，输入区窗口上移一行，把消息流最后一行（往往恰是刚渲染
-    的 ❯ 新消息）误划进输入区，污染 sent_signal / in_input 判定。"""
-    lines = frame.split("\n")
-    if lines and lines[-1] == "":
-        lines = lines[:-1]
-    if len(lines) <= INPUT_AREA_LINES:
-        return "", "\n".join(lines)
-    return "\n".join(lines[:-INPUT_AREA_LINES]), "\n".join(lines[-INPUT_AREA_LINES:])
-
-
 def wait_until(pred, timeout: float, interval: float = 0.2):
-    """轮询等谓词为真；超时后最后再验一次（边界帧竞态容忍）。
+    """轮询等谓词为真；超时后最后再验一次（边界竞态容忍）。
 
-    返回使谓词命中的 pred() 真实返回值（如 deliver_state 的
-    'text'/'collapsed' 三态），非布尔——2026-09-13 真实试用抓出 v0.2.5
-    缺陷：循环内 `return True` 把三态布尔化，`state == "collapsed"` 在
-    生产永不匹配，折叠展开主路成死代码（单测 mock 恰返回 pred() 值，
-    语义失真未被测试网拦住）。"""
+    返回使谓词命中的 pred() 真实返回值，非布尔（v0.2.6 教训：循环内
+    `return True` 把三态布尔化，折叠展开主路成死代码）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         result = pred()
@@ -194,235 +138,204 @@ def kill_previous(task: Task) -> None:
             pass
 
 
-def wakeup_markers(word: str) -> tuple[str, str]:
-    """唤醒词的可见特征片段：(head, tail)。
+# ---- hook 标记通道（compacting/compacted 的稳定信号）----
 
-    head：判「已作为用户消息提交」用——❯ 消息行的开头片段。必须配合
-    「非 /compact 前缀」使用：compact_cmd 内嵌唤醒词全文，其残留 ❯ 行
-    会被裸 head 检测命中（v0.2.2 事故形态）。
-    tail：判「仍在输入框」用——提交前文本折行渲染，tail 恒在输入框末行；
-    提交后框清空。tail 在框 ⇔ 尚未提交，是成功判据的前置守卫。
-    """
-    return word[:12], word.replace("\n", "")[-12:]
+def hook_path(session_id: str, event: str) -> Path:
+    """event: 'pre' | 'post'。标记文件名与 hooks/compact_hook.py 约定一致。"""
+    return HOOK_ROOT / f"{session_id}.{event}.json"
 
 
-def last_user_line(frame: str) -> str | None:
-    """全屏最后一条已提交用户消息行（❯ + 普通空格前缀；输入框是 ❯+nbsp，
-    天然不进此判据）。全屏搜而非只搜 chat 区：消息流内容少时（压缩刚
-    完成）新消息落进底部 N 行窗口，按区域搜会漏 → 判据永假 → 双发。"""
-    last = None
-    for line in frame.split("\n"):
-        if line.lstrip().startswith(MARK_USER_MSG):
-            last = line
-    return last
+def clear_stale_hooks(session_id: str, watcher_start: float) -> None:
+    """删除本 session 的陈旧 hook 标记（上次压缩遗留）。
+
+    双保险：删除 + 时序校验（ts 早于 watcher 启动的标记视为陈旧）——
+    删除失败/竞态时序校验兜底。"""
+    for event in ("pre", "post"):
+        p = hook_path(session_id, event)
+        if p.exists():
+            try:
+                p.unlink()
+                continue
+            except OSError:
+                pass
+        # 删不掉的留给 read_hook 的时序校验拒绝
 
 
-def sent_signal(frame: str, head: str, tail: str) -> bool:
-    """唤醒词已成功提交的屏幕信号：❯ 用户消息判据（v0.2.4）。
-
-    最后一条已提交用户消息（❯ +普通空格前缀）包含 head、且不是 /compact
-    命令（compact_cmd 残留同為用户消息且内嵌唤醒词全文，靠前缀排除），
-    且 tail 不在输入框（文本在框 ⇔ 尚未提交）。唤醒词提交后模型开始处理
-    会渲染 busy——但压缩后模型自动继续也会 busy，故 busy 不能作成功信号
-    （假 DONE 漏发），仅用于 swallow 等 idle 逻辑。"""
-    if in_input(frame, tail):
-        return False
-    line = last_user_line(frame)
-    if line is None:
-        return False
-    body = line.lstrip()[len(MARK_USER_MSG):]
-    return head in line and not body.lstrip().startswith(MARK_COMPACT_CMD)
+def read_hook(session_id: str, event: str, watcher_start: float) -> dict | None:
+    """读 hook 标记；陈旧标记（ts 早于 watcher 启动）返回 None。"""
+    p = hook_path(session_id, event)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if float(data.get("ts", 0)) < watcher_start:
+        return None
+    return data
 
 
-def deliver_state(frame: str, tail: str) -> str | None:
-    """注入文本在输入框的形态：'text' 明文在框 / 'collapsed' 折叠 paste 在框 /
-    None 未落地。折叠判定用 paste 展开提示（全屏匹配）——tail 明文在折叠态
-    不上屏，in_input 永假，必须分流专门处理。"""
-    if in_input(frame, tail):
-        return "text"
-    if MARK_PASTE_HINT in frame:
-        return "collapsed"
+# ---- transcript 通道（压缩完成兜底 + 唤醒词送达确认）----
+
+def find_transcript(session_id: str) -> Path | None:
+    """按 session_id 定位 transcript（~/.claude/projects/*/<sid>.jsonl）。"""
+    if PROJECTS_ROOT.is_dir():
+        hits = sorted(PROJECTS_ROOT.glob(f"*/{session_id}.jsonl"))
+        if hits:
+            return hits[0]
     return None
 
 
-def max_paste_id(frame: str) -> int:
-    """屏幕上最大的 [Pasted text #N] 编号（无则 0）。注入前记录作基线，
-    提交判据只认编号大于基线的新 blob——历史粘贴消息编号不递增，不误判。"""
-    return max((int(m.group(1)) for m in RE_PASTE_BLOB.finditer(frame)), default=0)
+def transcript_lines(path: Path | None) -> int:
+    """transcript 行数（基线锚点）。文件不存在/不可读返回 0。"""
+    if path is None or not path.exists():
+        return 0
+    try:
+        with path.open() as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
 
 
-def collapsed_sent(frame: str, prev_max: int) -> bool:
-    """折叠 paste 已提交：展开提示消失 + 出现编号 > prev_max 的新 blob 消息行。
+def scan_transcript(path: Path | None, baseline: int, *,
+                    head: str | None = None,
+                    compact_summary: bool = False) -> str | None:
+    """扫描 transcript 第 baseline 行之后的新增条目。
 
-    预览态必有提示相伴；提示消失说明输入框已清空、blob 转为已提交消息
-    （2026-09-13 pane %2 FAILED 后用户手动 Enter 验证过折叠态可直接提交）。
-    blob 行须是 ❯ 用户消息形态（消息流正式渲染），输入框里的不算。"""
-    if MARK_PASTE_HINT in frame:
-        return False
-    for line in frame.split("\n"):
-        if not line.lstrip().startswith(MARK_USER_MSG):
+    head 给定：找第一条含 head 且非 /compact 前缀且非 isCompactSummary 的
+    user 消息（唤醒词送达确认——compact_cmd 条目内嵌唤醒词全文、压缩摘要
+    可能复述唤醒词，两者都必须排除；基线之前的历史条目天然不参与）。
+    compact_summary=True：找 isCompactSummary 条目（压缩完成兜底信号）。
+    返回命中条目的内容（truthy），未命中 None。"""
+    if path is None or not path.exists():
+        return None
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    for ln in lines[baseline:]:
+        try:
+            d = json.loads(ln)
+        except json.JSONDecodeError:
             continue
-        if any(int(m.group(1)) > prev_max for m in RE_PASTE_BLOB.finditer(line)):
-            return True
-    return False
+        if compact_summary:
+            if d.get("isCompactSummary"):
+                return d.get("message", {}).get("content") or "compact summary"
+            continue
+        if d.get("type") != "user" or d.get("isCompactSummary"):
+            continue
+        c = (d.get("message") or {}).get("content")
+        if isinstance(c, list):
+            c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
+        if not isinstance(c, str):
+            continue
+        s = c.strip()
+        if not s or s.startswith(MARK_COMPACT_CMD):
+            continue
+        if head and head in s:
+            return s
+    return None
 
 
-def text_in_box(frame: str, tail: str, collapsed_mode: bool) -> bool:
-    """文本仍在输入框（⇔ 尚未提交）——nudge 补 Enter 的依据。折叠态下明文
-    不上屏，改用「展开提示仍在屏」：blob 未提交则提示必然还在。"""
-    if collapsed_mode:
-        return MARK_PASTE_HINT in frame
-    return in_input(frame, tail)
-
-
-def in_input(frame: str, tail: str) -> bool:
-    """tail 是否仍在输入框（⇔ 尚未提交）。
-
-    输入框的标志行是 ❯+nbsp 前缀（唯一提示符行），折行溢出在其**下方**
-    （长文本时首行被推入消息流区、tail 恒在末行——始终在 ❯\xa0 行之下）；
-    已提交消息是 ❯+普通空格前缀，其折行渲染行无前缀且位于空输入框
-    ❯\xa0 行**上方**——消息落进底部 N 行窗口时（消息流内容少：压缩刚
-    完成只有摘要几行）按「无前缀+含 tail」会把它误当输入框内容
-    （v0.2.6 e2e 在 120 宽 pane 抓出：sent 判据被永假拦截 → 三轮重发
-    双发；179 宽下唤醒词恰好单行不折行，漏洞被宽度巧合掩盖）。
-    故：窗口内有 ❯\xa0 行时，tail 所在行必须在其下方或同行；窗口内
-    没有（输入区扩展出窗口的长文本落地态）则退回行级判定。"""
-    lines = split_screen(frame)[1].split("\n")
-    box_start = None  # 输入框提示符行（❯+nbsp）在窗口内的位置
-    for i, line in enumerate(lines):
-        if line.lstrip().startswith(MARK_INPUT):
-            box_start = i
-    for i, line in enumerate(lines):
-        if box_start is not None and i < box_start:
-            continue  # 提示符上方：消息流渲染行（含提交消息的折行续行）
-        if tail in line and not line.lstrip().startswith(MARK_USER_MSG):
-            return True
-    return False
+def wakeup_head(word: str) -> str:
+    """唤醒词开头片段——transcript user 条目的匹配特征。配合「非 /compact
+    前缀 + 基线增量」双排除（compact_cmd 内嵌唤醒词全文是 v0.2.2 事故形态）。"""
+    return word[:12]
 
 
 def dump_bottom(task: Task, pane: str) -> None:
-    """落地失败时把屏幕底部留痕进日志——2026-09-12 pane %2 FAILED 事故没有
-    现场形态，只能推断；此后失败可精确归因。"""
-    task.log("landed=False, bottom 10 lines dump:")
+    """失败时把屏幕底部留痕进日志（v0.3 屏幕抓取仅剩此用途——诊断，不判定）。"""
+    task.log("wakeup unconfirmed, bottom 10 lines dump:")
     for line in capture(pane).rstrip("\n").split("\n")[-10:]:
         task.log(f"  | {line[:120]}")
 
 
-def deliver_wakeup(task: Task, reason: str) -> bool:
-    """投递唤醒词：注入 → 落地确认（明文/折叠分流）→ Enter → 验证 → 分级补救。
-    见模块 docstring。"""
-    pane = task.cfg["pane"]
-    word = task.cfg["wakeup_word"]
-    head, tail = wakeup_markers(word)
+def inject_line(pane: str, text: str) -> None:
+    """注入一行文本并提交：清框 → 文本 → 短歇 → Enter。
 
-    # 入口基线：屏上已有的 blob（折叠提交的 /compact 命令——paste_collapse
-    # 全链路下 compact_cmd 同样被折叠，编号 ≤ 基线）不参与「唤醒词已送达」
-    # 判定，轮前复查只认本函数注入产生的新 blob（e2e paste_collapse 抓出的
-    # 假 DONE：blob#1=compact 提交被误判为唤醒词已送达）
-    prev_max = max_paste_id(capture(pane))
+    文本+Enter 直发不再做屏幕落地确认——三种形态（idle 明文 / busy 排队 /
+    折叠 blob）最终都会提交且 transcript 记录完整原文（模块 docstring）；
+    文本被吞则 Enter 提交空框（无害），transcript 无新条目 → 上层重注。"""
+    clear_input(pane)
+    send_text(pane, text)
+    time.sleep(KEY_TEXT_SETTLE)
+    send_key(pane, "Enter")
+
+
+def deliver_wakeup(task: Task, pane: str, session_id: str, reason: str) -> bool:
+    """投递唤醒词：注入+Enter 连发 → transcript 出现新增 user 条目含 head。
+
+    轮前复查上轮延迟提交（busy 期 Enter 排队、忙完才写入 transcript）；
+    三轮退避重注；失败 FAILED 落盘 + dump 留痕。"""
+    word = task.cfg["wakeup_word"]
+    head = wakeup_head(word)
+    transcript = find_transcript(session_id)
+    task.log(f"wakeup transcript: {transcript} (session {session_id[:8]}…)")
+    if transcript is None:
+        task.log("transcript not found — deliver 确认降级为纯重试（无送达判据）")
+
+    # 基线：注入前的行数。历史条目（compact_cmd / 压缩摘要，均可能内嵌
+    # 唤醒词全文）天然不参与判定
+    baseline = transcript_lines(transcript)
     for rnd in range(1, DELIVER_ROUNDS + 1):
-        time.sleep(DELIVER_BACKOFF[rnd - 1])  # 轮前退避：跨过压缩后 TUI 忙期
-        # 轮前复查：上轮 Enter 可能被 busy 排队、模型忙完才提交渲染（晚于
-        # 上轮验证窗口）——不复查会重注双发
-        frame = capture(pane)
-        if sent_signal(frame, head, tail) or collapsed_sent(frame, prev_max):
+        time.sleep(DELIVER_BACKOFF[rnd - 1])  # 轮前退避：跨过压缩后忙期
+        # 轮前复查：上轮 Enter 排队、模型忙完才写入 transcript（晚于轮内
+        # 验证窗）——不复查会重注双发
+        if scan_transcript(transcript, baseline, head=head):
             task.update(state="DONE", end_reason=f"{reason} (delayed confirm)")
             task.log(f"wakeup delivered by pre-round check (round {rnd}, {reason})")
             return True
 
         task.update(state="DELIVERING", wakeup_round=rnd)
-        prev_max = max_paste_id(capture(pane))
-        clear_input(pane)
-        send_text(pane, word)
-        state = wait_until(lambda: deliver_state(capture(pane), tail), DELIVER_TEXT_TIMEOUT, 0.15)
-        task.log(f"wakeup round {rnd}: text state={state}")
-        if state == "collapsed":
-            # 折叠主路：再注入一次模拟「再粘贴一次」（paste again to expand，
-            # 用户实测两次 ctrl+v 取消折叠）→ blob 展开为明文走正常判据
-            task.log(f"wakeup round {rnd}: paste collapsed, re-send to expand")
-            send_text(pane, word)
-            state = wait_until(lambda: deliver_state(capture(pane), tail), EXPAND_TEXT_TIMEOUT, 0.15)
-            task.log(f"wakeup round {rnd}: after expand, state={state}")
-        if state is None:
-            dump_bottom(task, pane)  # 文本被吞或忙期不收输入 → 留痕后退避重试
-            continue
-
-        collapsed_mode = state == "collapsed"  # 展开失败：走折叠提交兜底
-
-        def confirm_sent(frame: str) -> bool:
-            if sent_signal(frame, head, tail):
-                return True
-            return collapsed_mode and collapsed_sent(frame, prev_max)
-
-        send_key(pane, "Enter")
-        ok = wait_until(lambda: confirm_sent(capture(pane)), DELIVER_SENT_TIMEOUT, 0.2)
-        task.log(f"wakeup round {rnd}: after enter, sent={ok}")
-        if ok:
+        inject_line(pane, word)
+        task.log(f"wakeup round {rnd}: injected, waiting transcript entry")
+        hit = wait_until(
+            lambda: scan_transcript(transcript, baseline, head=head),
+            DELIVER_SENT_TIMEOUT, POLL_INTERVAL,
+        )
+        if hit:
             task.update(state="DONE", end_reason=reason)
             task.log(f"wakeup delivered ({reason})")
             return True
-
-        # 分级补救：文本仍在输入框（Enter 被吞/排队）→ 只补 Enter（幂等，不重发文本）
-        for nudge in range(1, ENTER_NUDGES + 1):
-            frame = capture(pane)
-            if confirm_sent(frame):
-                task.update(state="DONE", end_reason=reason)
-                task.log(f"wakeup delivered after nudge {nudge} ({reason})")
-                return True
-            if text_in_box(frame, tail, collapsed_mode):
-                task.log(f"wakeup enter nudge {nudge} (text still in input)")
-                send_key(pane, "Enter")
-                time.sleep(0.8)
-            else:
-                break  # 文本不在框：已提交待渲染或被吞，走延迟复检
-
-        # 渲染滞后容忍：❯ 消息行可能晚于 Enter 数百毫秒出现
-        time.sleep(DELIVER_RECHECK)
-        if confirm_sent(capture(pane)):
-            task.update(state="DONE", end_reason=f"{reason} (late render confirm)")
-            task.log(f"wakeup delivered by late-render confirm ({reason})")
-            return True
+        task.log(f"wakeup round {rnd}: no transcript entry after {DELIVER_SENT_TIMEOUT}s")
+        dump_bottom(task, pane)  # 留痕：文本被吞/忙期不收输入的现场
 
     task.update(state="FAILED", end_reason=f"wakeup unconfirmed ({reason})")
     task.log(f"wakeup FAILED after {DELIVER_ROUNDS} rounds ({reason})")
     return False
 
 
-def wait_for_idle(task: Task, pane: str, t0: float, global_deadline: float) -> bool:
-    """轮询等 busy 标记消失（真 idle）。返回 False 表示全局超时。"""
-    while time.time() - t0 < global_deadline:
-        if MARK_BUSY not in capture(pane):
-            return True
-        time.sleep(IDLE_POLL)
-    return False
-
-
-def inject_compact_cmd(task: Task, pane: str) -> None:
-    """注入 /compact 命令：清框 → 文本落地确认后再发 Enter（与唤醒词同一防抖手法）。"""
-    cmd = task.cfg["compact_cmd"]
-    tail = cmd.replace("\n", "")[-12:]
-    clear_input(pane)
-    send_text(pane, cmd)
-    # 落地确认替代固定 1.5s：命令是数百字长串（含唤醒词全文），瞬时注入后
-    # 必须等 TUI 真正把它渲染进输入框，否则 Enter 可能发在文本落地前。
-    wait_until(lambda: tail in split_screen(capture(pane))[1], DELIVER_TEXT_TIMEOUT, 0.15)
-    time.sleep(0.2)
-    send_key(pane, "Enter")
-
-
 def run(task: Task) -> None:
     pane = task.cfg["pane"]
+    session_id = task.cfg["session_id"]
     settle = float(task.cfg.get("settle_seconds", 6))
-    global_deadline = float(task.cfg.get("global_timeout", 300))
+    global_deadline = float(task.cfg.get("global_timeout", 600))
     retries = int(task.cfg.get("retry_limit", 2))
 
+    watcher_start = time.time()
     kill_previous(task)
     task.update(watcher_pid=os.getpid(), state="WAIT_SETTLE")
-    task.log(f"watcher start pid={os.getpid()} pane={pane}")
+    task.log(f"watcher start pid={os.getpid()} pane={pane} session={session_id[:8]}…")
+
+    clear_stale_hooks(session_id, watcher_start)
 
     t0 = time.time()
     time.sleep(settle)  # 等模型收尾总结、TUI 回到输入态
 
+    transcript = find_transcript(session_id)
+    # 基线在**注入 /compact 之前**取：本轮压缩的 isCompactSummary 条目落在
+    # 新增区（多 attempt 重注也全在基线后）；同 session 上次压缩的历史
+    # 摘要条目在基线前，天然不参与判定
+    baseline = transcript_lines(transcript)
+
+    def compact_signal():
+        """压缩已被接受且（或已开始）的信号：PreCompact 标记，或 transcript
+        出现本轮压缩摘要（hook 未注册/旧版 Claude Code 的兜底——那时 pre
+        永不到，但压缩真的执行，isCompactSummary 出现 = 已完成）。"""
+        return read_hook(session_id, "pre", watcher_start) or \
+            scan_transcript(transcript, baseline, compact_summary=True)
+
+    compact_started = None
     for attempt in range(1, retries + 2):
         if not pane_alive(pane):
             task.update(state="ABORTED", end_reason="pane gone")
@@ -431,49 +344,43 @@ def run(task: Task) -> None:
             break
 
         task.update(state="INJECTING", attempt=attempt)
-        inject_compact_cmd(task, pane)
-        task.log(f"compact injected (attempt {attempt})")
+        inject_line(pane, task.cfg["compact_cmd"])
+        task.log(f"compact injected (attempt {attempt}), waiting PreCompact/transcript signal")
 
-        # 阶段一：等压缩真正开始（只认 Compacting/▰；陈旧 Compacted 不算）
-        started = False
-        swallowed = False
-        start_by = time.time() + START_TIMEOUT
-        while time.time() < start_by:
-            if time.time() - t0 > global_deadline:
-                break
-            frame = capture(pane)
-            if MARK_COMPACTING in frame or "▰" in frame:
-                started = True
-                break
-            if MARK_BUSY in frame:
-                swallowed = True
-                break
-            time.sleep(POLL_INTERVAL)
+        # 阶段一：PreCompact 标记 = Claude Code 确切接受了 /compact 命令。
+        # 长超时覆盖 busy 期输入排队（/compact 在队列里没丢——v0.2.x 21s 等
+        # 屏幕特征误判「被吞」双发的事故根源）。swallow 形态（被当普通消息
+        # 吞）两信号都不触发，超时自然重试。task.json 可覆盖超时（e2e 加速）。
+        pre_timeout = float(task.cfg.get("precompact_timeout", PRECOMPACT_TIMEOUT))
+        sig = wait_until(compact_signal, pre_timeout, POLL_INTERVAL)
+        if sig:
+            compact_started = sig
+            break
+        task.log(f"attempt {attempt}: no compaction signal in {pre_timeout:g}s, retrying")
 
-        if started:
-            # 阶段二：压缩进行中——只等完成或全局超时，绝不重注
-            task.update(state="COMPACTING")
-            task.log("compaction confirmed running")
-            while time.time() - t0 < global_deadline:
-                if MARK_COMPACTED in capture(pane):
-                    time.sleep(1.0)  # 等 TUI 完成首帧重绘再投递
-                    deliver_wakeup(task, "compacted confirmed")
-                    return
-                time.sleep(POLL_INTERVAL)
-            break  # 全局超时 → 兜底
+    if compact_started is None:
+        # 压缩从未被接受（重试耗尽/全局超时）——仍投递唤醒词（晚到无损）
+        task.log("no compaction signal after retries, fallback deliver")
+        deliver_wakeup(task, pane, session_id, "no compaction signal fallback")
+        return
 
-        if swallowed:
-            # /compact 被当成普通消息：等模型真正 idle 再重试
-            task.log("compact swallowed as message, waiting for idle")
-            if not wait_for_idle(task, pane, t0, global_deadline):
-                break  # 全局超时 → 兜底
-            continue
+    # 阶段二：压缩进行中——等 PostCompact 标记（主路）或 transcript
+    # isCompactSummary（兜底）。绝不重注 /compact。
+    task.update(state="COMPACTING")
+    task.log("compaction accepted (PreCompact hook)" if read_hook(session_id, "pre", watcher_start)
+             else "compaction detected (transcript isCompactSummary)")
+    done = wait_until(
+        lambda: read_hook(session_id, "post", watcher_start)
+        or scan_transcript(transcript, baseline, compact_summary=True),
+        COMPACT_DONE_TIMEOUT, POLL_INTERVAL,
+    )
+    if done:
+        task.log("compaction done"
+                 + (" (PostCompact hook)" if read_hook(session_id, "post", watcher_start) else " (transcript isCompactSummary)"))
+    else:
+        task.log(f"no completion signal in {COMPACT_DONE_TIMEOUT}s, fallback deliver")
 
-        # 既没开始也没被吞（屏幕无特征）：小睡后重试
-        task.log(f"attempt {attempt}: no markers on screen, retrying")
-        time.sleep(2)
-
-    deliver_wakeup(task, "retries/global-timeout fallback")
+    deliver_wakeup(task, pane, session_id, "compacted confirmed")
 
 
 if __name__ == "__main__":

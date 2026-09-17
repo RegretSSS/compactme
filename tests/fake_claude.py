@@ -1,35 +1,45 @@
 #!/usr/bin/env python3
-"""fake_claude — 模拟 Claude Code TUI 的 compact 行为，供 watcher 端到端测试。
+"""fake_claude — 模拟 Claude Code 的 compact 生命周期，供 watcher 端到端测试。
 
-v3（配合 watcher v0.2.4 ❯ 判据）：按 2026-09-12 pane %2 实测的真实 TUI 形态修正——
-  - 输入框**折行**渲染（v2 的「横向左滚只露尾部」模型是错的：实测 727 字符
-    在 179 列 pane 折成 5+ 行占满屏幕；tail 恒在末行，watcher 的底部 4 行
-    检测依然有效）
-  - 用户消息渲染为 ❯ 前缀行（真 TUI 用户消息带灰底，程序判据只看 ❯ 前缀）
-  - C-u **无操作**（实测不清框）；0x7f BSpace 逐字符删——watcher 清框依赖此
-  - 空框 Enter 无操作（真 TUI 行为；watcher 补 Enter 的安全性依赖于此）
+v4（配合 watcher v0.3 hooks+transcript 信号源）：watcher 不再看屏幕——
+fake 的新增保真点是 Claude Code 的**持久层信号**，屏幕渲染保留仅为 dump
+留痕与人工诊断：
+  - transcript 写盘（env TRANSCRIPT）：提交即写 user 条目；/compact 被接受
+    时按真实 transcript 形态（2026-09-17 backend 事故段实证）依次写：
+    命令条目（/compact 前缀）→ isCompactSummary 摘要条目 → <command-name>
+    条目——watcher 的唤醒词判据必须忽略前两者（compact_cmd 内嵌唤醒词
+    全文、摘要可能复述唤醒词）
+  - hook 标记（env SESSION_ID + HOOK_DIR）：/compact 被接受时写 .pre.json，
+    压缩完成写 .post.json（真实环境由插件 hooks/hooks.json 的
+    PreCompact/PostCompact hook 写，形态一致）
 
 模式（环境变量 MODE）：
-  normal    （默认）/compact → Compacting… → 2s → Compacted
-  swallow   第 1 个 /compact 被当普通消息（渲染 esc to interrupt 3s 后应答），
-            第 2 个起正常压缩——测 watcher 的等-idle-重试路径
-  eat_enter 第 1 个 Enter 被吞（文本滞留输入框）——测补 Enter 幂等路径
-  lost_text 第 1 段注入文本被重绘吞掉（不回显不进框）——测退避重注路径
-  paste_collapse 大块文本段（>100 字符）折叠为 [Pasted text #N] 占位符 +
-            paste again to expand 提示（明文不上屏——2026-09-13 pane %2 生产
-            事故形态）；再次大块到达 → 展开为明文（两次拼接）；Enter 对折叠
-            blob 直接提交（提交内容记录 RECV，消息流渲染折叠形态行）——
-            测 watcher 的折叠识别/二次注入展开/兜底提交三路径
+  normal    （默认）/compact → pre → Compacting… 2s → 摘要/命令条目 → post → Compacted
+  swallow   第 1 个 /compact 被当普通消息（不写 hook/不压缩，3s 后应答），
+            第 2 个起正常压缩——测 watcher 无信号重试路径
+  eat_enter 第 1 个 Enter 被吞（文本滞留输入框，transcript 无条目）——测重注
+  lost_text 第 1 段注入文本被重绘吞掉——测重注
+  paste_collapse 大块文本段（>100 字符）折叠为 [Pasted text #N] 占位符
+            （明文不上屏）；Enter 对折叠 blob 直接提交——**transcript 仍记
+            完整原文**（2026-09-13 pane %2 生产事故形态 + 09-17 transcript
+            实证：这正是 v0.3 免疫屏幕雷区的根基）
+  busy_defer 非 compact 提交的 transcript 条目延迟 5s 写（busy 期 Enter
+            排队、模型忙完才提交写入——2026-09-17 backend 事故时序）——
+            测 watcher 长验证窗轮询命中
 
 保真要点：
-- alternate screen + ANSI 清屏整帧重绘（旧行/busy 标记在下一次渲染消失）
-- 消息流行与输入框行均按终端宽度折行（东亚字符宽 2 的简化 wcwidth）
+- 输入侧 raw（ICANON/ICRNL 关）——tmux send-keys 的 \r 原样交付，
+  「文本在框、Enter 提交」分离语义（e2e 实测教训）；输出侧保留 OPOST
+- alternate screen + 整帧重绘；消息/输入框按终端宽度折行（东亚宽 2 简化）
+- C-u 无操作、BSpace 逐字符删、空框 Enter 无操作（真 TUI 实测行为）
 所有提交的行记录到 /tmp/compactme-e2e/received.log 供断言。
 """
+import json
 import os
 import shutil
 import termios
 import time
+from pathlib import Path
 
 # 真 TUI 的输入侧是 raw 的：ICANON/ICRNL 关闭，tmux send-keys 的 \r 原样交付、
 # 文本段不等待行终结即可读——否则 Enter 被 pty 行缓冲吃掉，无法模拟
@@ -45,6 +55,9 @@ except termios.error:
     pass  # 非 tty（管道驱动）时退化为行缓冲模型
 
 MODE = os.environ.get("MODE", "normal")
+SESSION_ID = os.environ.get("SESSION_ID", "e2e-fake-session")
+TRANSCRIPT = Path(os.environ.get("TRANSCRIPT", "/tmp/compactme-e2e/transcript.jsonl"))
+HOOK_DIR = Path(os.environ.get("HOOK_DIR", "/tmp/compactme/hooks"))
 
 LOG = open("/tmp/compactme-e2e/received.log", "a", buffering=1)
 WIDTH, HEIGHT = shutil.get_terminal_size().columns, shutil.get_terminal_size().lines
@@ -89,37 +102,62 @@ def render():
     if busy:
         lines.append("  (esc to interrupt while thinking…)")
     if collapsed:
-        # 折叠 paste 预览（仿 2026-09-13 pane %2 dump）：blob 预览行（上下
-        # 分隔线）+ 状态行 + 展开提示 + 空行 + 输入框——明文不上屏
+        # 折叠 paste 预览（仿 2026-09-13 pane %2 dump）：blob 预览行 + 提示
         lines.append("─" * 30)
         lines.append(f"❯ [Pasted text #{blob_seq}]")
         lines.append("─" * 30)
-        lines.append("  fake@localhost · status")
         lines.append("  paste again to expand")
         lines.append("")
-    # 输入框行 = ❯ + nbsp（真 TUI 字节级形态，空框/有文本/折行首行同形态；
-    # 已提交消息才是 ❯ + 普通空格——watcher 靠这两态区分「在框」vs「已发出」）
+    # 输入框行 = ❯ + nbsp；已提交消息才是 ❯ + 普通空格（v0.2.x 屏幕判据遗产，
+    # v0.3 watcher 已不依赖——保留渲染形态供 dump 留痕比对）
     lines += fold("❯\xa0" + input_buf, WIDTH)
     lines.append("─" * 20 + " status " + "─" * 20)
-    # 真 TUI 布局锚定屏幕底部：内容沉底、输入框与状态行钉在 pane 末行——
-    # watcher 的「底部 N 行=输入区」依赖此（顶部锚定会让输入区取到空行）
     lines = [""] * max(0, HEIGHT - len(lines)) + lines[-HEIGHT:]
     print("\033[2J\033[H" + "\n".join(lines), end="", flush=True)
 
 
+def write_hook(event: str):
+    """写 hook 标记——真实环境由插件 hooks/compact_hook.py 写，形态一致。"""
+    suffix = {"PreCompact": "pre", "PostCompact": "post"}[event]
+    HOOK_DIR.mkdir(parents=True, exist_ok=True)
+    (HOOK_DIR / f"{SESSION_ID}.{suffix}.json").write_text(json.dumps({
+        "event": event, "ts": time.time(),
+        "transcript_path": str(TRANSCRIPT), "trigger": "manual",
+    }, ensure_ascii=False))
+
+
+def append_transcript(content: str, compact_summary: bool = False):
+    """追加 transcript 条目（真实 jsonl 形态的简化子集：watcher 判据相关字段）。"""
+    TRANSCRIPT.parent.mkdir(parents=True, exist_ok=True)
+    with TRANSCRIPT.open("a") as f:
+        f.write(json.dumps({
+            "type": "user", "isCompactSummary": compact_summary,
+            "message": {"role": "user", "content": content},
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S") + ".000Z",
+            "session_id": SESSION_ID,
+        }, ensure_ascii=False) + "\n")
+
+
 def handle_submit(line: str, paste_seq: int | None = None):
-    """paste_seq 非 None = 折叠 blob 提交：内容仍是完整原文（RECV 记录），
-    消息流渲染为折叠形态行（真 TUI 行为）。"""
+    """paste_seq 非 None = 折叠 blob 提交：屏幕渲染折叠形态行，但 transcript
+    记完整原文（真实行为——v0.3 判据免疫折叠的根基）。"""
     global busy, swallowed
     LOG.write(f"RECV|{time.strftime('%H:%M:%S')}|{line}\n")
-    # 真 TUI 把用户命令渲染为 ❯ 前缀消息行（含 compact_cmd 内嵌的唤醒词全文，
-    # 压缩完成后仍留在屏幕上——v0.2.2 生产事故的屏幕形态，e2e 必须复现）
     screen.append(f"❯ [Pasted text #{paste_seq}]" if paste_seq else f"❯ {line}")
     render()
     if line.startswith("/compact") and not (MODE == "swallow" and swallowed == 0):
+        # transcript 先记命令条目（含唤醒词全文——watcher 判据须 /compact 前缀排除）
+        append_transcript(line)
+        write_hook("PreCompact")
         screen.append("  ✶ Compacting conversation…")
         render()
         time.sleep(2)
+        # 摘要条目可能复述唤醒词（isCompactSummary 排除依据）+ 命令回显条目
+        append_transcript(
+            "This session is being continued from a previous conversation… 摘要"
+            f"（含唤醒词预告）：{line[:120]}", compact_summary=True)
+        append_transcript("<command-name>/compact</command-name>  <local-command-stdout>Compacted</local-command-stdout>")
+        write_hook("PostCompact")
         screen.append("  ⎿ Compacted (ctrl+o to see full summary)")
         render()
     else:
@@ -127,7 +165,9 @@ def handle_submit(line: str, paste_seq: int | None = None):
             swallowed += 1
         busy = True
         render()
-        time.sleep(3)
+        if MODE == "busy_defer":
+            time.sleep(5)  # busy 排队：模型忙完才提交写入 transcript
+        append_transcript(line)
         busy = False
         screen.append(f"  (assistant reply to: {line[:50]})")
         render()
@@ -159,21 +199,15 @@ while True:
                 pass  # 文本段被 TUI 重绘吞掉：不回显不进框
             elif MODE == "paste_collapse" and len(part) > 100:
                 # 大块瞬时文本 → 按 paste 处理折叠为 blob（明文不上屏）
-                if collapsed:
-                    # 再粘贴一次 → 展开（paste again to expand）：两份拼接
-                    input_buf = pending + part
-                    pending = ""
-                    collapsed = False
-                else:
-                    collapsed = True
-                    blob_seq += 1
-                    pending = part
+                collapsed = True
+                blob_seq += 1
+                pending = part
             else:
                 input_buf += part
         if idx < len(parts) - 1:  # 本段后有 \r
             enter_count += 1
             if MODE == "eat_enter" and enter_count == 1:
-                pass  # Enter 被吞：文本滞留输入框
+                pass  # Enter 被吞：文本滞留输入框（transcript 无条目）
             elif collapsed:
                 # 折叠 blob 直接提交（2026-09-13 pane %2 用户手动 Enter 验证）
                 collapsed = False

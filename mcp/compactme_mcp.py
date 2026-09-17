@@ -20,6 +20,7 @@ from fastmcp import FastMCP
 mcp = FastMCP("compactme")
 
 PANE = os.environ.get("TMUX_PANE")
+SESSION_ID = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
 HERE = Path(__file__).parent
 TASK_ROOT = Path("/tmp/compactme")
 
@@ -89,12 +90,11 @@ def _parse_statusbar_context() -> dict | None:
 
 
 def _find_transcript() -> Path | None:
-    session_id = os.environ.get("CLAUDE_SESSION_ID")
     projects = Path.home() / ".claude" / "projects"
     if not projects.is_dir():
         return None
-    if session_id:
-        for p in projects.glob(f"*/{session_id}.jsonl"):
+    if SESSION_ID:
+        for p in projects.glob(f"*/{SESSION_ID}.jsonl"):
             return p
     # 回退：最近修改的 transcript（多会话并行时可能拿错，仅作估算）
     candidates = sorted(projects.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime)
@@ -157,8 +157,9 @@ def context_stats() -> str:
 
 @mcp.tool()
 def compactme(compact_instructions: str, wakeup_word: str, settle_seconds: float = 6.0) -> str:
-    """给自己安排一次自压缩 + 自唤醒。调用后立即返回；后台 watcher 会在确认
-    /compact 真正执行完毕（屏幕出现 Compacted）后，再注入唤醒词。
+    """给自己安排一次自压缩 + 自唤醒。调用后立即返回；后台 watcher 通过
+    PreCompact/PostCompact hook 标记与 session transcript 确认压缩生命周期
+    （v0.3 信号源，不依赖屏幕形态），压缩完成后注入唤醒词。
 
     必须作为本轮最后一个工具调用，之后立即写收尾总结并结束回合。
 
@@ -172,6 +173,8 @@ def compactme(compact_instructions: str, wakeup_word: str, settle_seconds: float
     """
     if not PANE:
         return "错误：未检测到 $TMUX_PANE——compactme 只在 tmux 内运行的 Claude Code 会话中可用。"
+    if not SESSION_ID:
+        return "错误：未检测到 CLAUDE_CODE_SESSION_ID——v0.3 依赖 hook 标记与 transcript 信号源，无法定位本会话。"
     if not wakeup_word.strip():
         return "错误：唤醒词不能为空——没有唤醒词，压缩后的新上下文无法恢复任务。"
     if not _has_rebuild_clue(wakeup_word):
@@ -193,6 +196,7 @@ def compactme(compact_instructions: str, wakeup_word: str, settle_seconds: float
 
     task = {
         "pane": PANE,
+        "session_id": SESSION_ID,
         "compact_cmd": compact_cmd,
         "wakeup_word": wakeup_word,
         "settle_seconds": settle_seconds,
@@ -210,9 +214,9 @@ def compactme(compact_instructions: str, wakeup_word: str, settle_seconds: float
     )
 
     return (
-        f"已派发 watcher（任务目录 {task_dir}）。\n"
+        f"已派发 watcher（任务目录 {task_dir}，session {SESSION_ID[:8]}…）。\n"
         f"  1. {settle_seconds}s 后注入：{compact_cmd}\n"
-        f"  2. 确认 Compacted 后注入唤醒词：{wakeup_word}\n"
+        f"  2. PostCompact hook / transcript 确认压缩完成后注入唤醒词：{wakeup_word}\n"
         "现在立即结束回合（先给用户一段收尾总结），不要再发起任何工具调用。"
     )
 

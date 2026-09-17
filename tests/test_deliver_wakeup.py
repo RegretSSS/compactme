@@ -1,39 +1,33 @@
 #!/usr/bin/env python3
-"""deliver_wakeup 可靠投递协议的单元测试（mock 屏幕 + 按键记录）。
+"""deliver_wakeup + transcript/hook 信号源的单元测试（v0.3）。
 
-v0.2.5 判据：成功 = 消息流最后一条 ❯ 用户消息含唤醒词 head 且非 /compact
-前缀，且 tail 不在输入区（文本在框 ⇔ 尚未提交的守卫）。busy 不再是成功信号。
-折叠 paste 态（v0.2.5，2026-09-13 pane %2 生产事故）：busy 期大块注入被折叠为
-[Pasted text #N] 占位符、明文不上屏 → 二次注入展开；展开失败则直接提交 blob，
-以「提示消失 + 编号递增的 blob 消息行」判成功。
+v0.3 判据：唤醒词送达 = transcript **新增** user 条目含 head、非 /compact
+前缀、非 isCompactSummary（compact_cmd 内嵌唤醒词全文、压缩摘要复述唤醒词
+都必须排除——2026-09-17 backend 事故 transcript 段实证形态）；压缩生命
+周期 = PreCompact/PostCompact hook 标记，兜底 transcript isCompactSummary。
+屏幕抓取仅剩 dump 留痕。
 
 覆盖路径：
-  1. happy        注入落地 → Enter → ❯ 消息出现 → 一次成功
-  2. eat_enter    第一个 Enter 被 TUI 吞（文本滞留输入框）→ 只补 Enter 成功，
-                  绝不重发文本（防双发核心不变量）
-  3. lost_text    第 1 轮注入文本被重绘吞掉 → dump 留痕 → 轮前退避后重注成功
-  4. residual     回归（v0.2.2 生产事故 03:26/11:14）：压缩后消息流残留
-                  /compact 命令行（❯ 用户消息、内嵌唤醒词全文）——判据必须
-                  以 /compact 前缀排除之；配合 Enter 被吞仍走 nudge
-  5. late_render  Enter 已提交但 ❯ 消息渲染滞后（帧队列精确驱动）→ 不重注
-                  不补 Enter，延迟复检期判据出现 → DONE
-  6. no_busy      提交后 busy 永不出现——❯ 判据独立于 busy（v0.2.4 关键变更：
-                  压缩后模型自动继续也会 busy，busy 不能作成功信号）
-  7. all_fail     三轮全失败 → state=FAILED（不假 DONE）
-  8. prefill      输入框有残留脏文本 → 注入前 BSpace 清框，提交内容纯净
-  9. paste_expand 回归（v0.2.5 生产事故）：注入被折叠 → 二次注入展开明文 →
-                  正常 Enter → ❯ 判据成功
-  10. paste_submit 展开失败（永远折叠）→ blob 直接 Enter 提交（用户手动
-                  验证过的救法）→ collapsed_sent 编号判据成功
-  11. delayed     round1 的 Enter 排队、提交渲染晚于轮内全部验证窗口 →
-                  round2 轮前复查命中 → 不重注（防双发）
-  12-15. 判据直测 sent_signal 三形态 + collapsed_sent 三形态
+  1. happy        注入+Enter → transcript 条目出现 → 一次成功
+  2. delayed      round1 验证窗后才写入（busy 期 Enter 排队、忙完才提交）
+                  → round2 轮前复查命中 → 不重注（防双发核心不变量）
+  3. all_fail     transcript 条目永不出现 → 三轮重注后 FAILED（不假 DONE）
+  4. residual     回归（v0.2.2 事故的 transcript 形态）：基线前有 /compact
+                  命令条目（内嵌唤醒词全文）+ isCompactSummary 摘要（复述
+                  唤醒词）→ 轮前复查不误判，正常投递成功
+  5. no_transcript transcript 定位失败 → 无判据，三轮后诚实 FAILED
+  6. run 主干     pre/post 标记齐 → COMPACTING → deliver 成功
+  7-10. scan_transcript 直测：head 命中 / compact 前缀排除 / 摘要排除 /
+        基线增量不漏 / list 型 content
+  11-12. hook 标记直测：陈旧 ts 拒绝（上次压缩遗留不误判）/ 启动清删
+  13. wait_until 语义直测（v0.2.6 mock 失真教训，跨版本保留）
 
-确定性策略：time.sleep 置 no-op、wait_until 单次求值——capture 消耗帧队列，
-路径完全可推演，无真实时间依赖。
+确定性策略：time.sleep 置 no-op、wait_until 单次求值——transcript 是真实
+临时文件，路径完全可推演，无真实时间依赖。
 """
 import importlib.util
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -47,131 +41,54 @@ _SPEC.loader.exec_module(watcher)
 _REAL_WAIT_UNTIL = watcher.wait_until  # fast_time mock 前保存真实实现
 
 WORD = "[续任务：批B开工] 去哪读：memory/MEMORY.md 与 project_deploy-8ca3617-20260910.md。怎么续：启动批B workflow 四步。"
-HEAD, TAIL = watcher.wakeup_markers(WORD)
-FILLER = "\n".join(f"chat history line {i:03d}" for i in range(30))
-INPUT_ONE_LINE = 40  # 输入框一行容量（超过即折行：首行溢出到消息流区）
+HEAD = WORD[:12]
+SID = "test-session-abc123"
 
 
-def frame_of_collapsed(blob_seq: int, chat_lines: list[str] | None = None) -> str:
-    """折叠 paste 帧形态（仿 2026-09-13 pane %2 FAILED 现场 dump）：
-    blob 预览行（上下分隔线）+ 状态行 + paste again to expand 提示 + 空行 +
-    空输入框——明文 tail 不上屏，仅提示可判折叠。"""
-    chat = list(chat_lines or [])
-    chat += ["─" * 40, f"❯ [Pasted text #{blob_seq}]", "─" * 40]
-    bottom = ["  status line", "  paste again to expand", "", "❯\xa0"]
-    return "\n".join([FILLER] + chat + bottom)
+def write_entry(path: Path, content, compact_summary: bool = False, type_: str = "user") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps({
+            "type": type_, "isCompactSummary": compact_summary,
+            "message": {"role": "user", "content": content},
+        }, ensure_ascii=False) + "\n")
 
 
-def frame_of(input_text: str = "", chat_lines: list[str] | None = None, busy: bool = False) -> str:
-    """构造模拟帧：30 行消息流 + 输入框（折行溢出保真）+ 边框 + 状态行。
+class FakeSession:
+    """模拟注入目标（tmux 调用记录）+ Claude Code 提交语义（写 transcript）。
 
-    长文本折行（2026-09-12 实测真 TUI 形态）：输入框首行（❯ + head 段）
-    被推进消息流区，tail 恒在末行——sent_signal 必须不被框首行的 head 欺骗。
-    """
-    chat_lines = list(chat_lines or [])
-    if busy:
-        chat_lines.append("  (esc to interrupt while thinking…)")
-    if len(input_text) > INPUT_ONE_LINE:
-        chat_lines.append("❯\xa0" + input_text[:INPUT_ONE_LINE])  # 折行首行溢出到消息流
-        tail_line = input_text[-30:]                               # 末行无前缀
-    else:
-        tail_line = ("❯\xa0" + input_text) if input_text else "❯\xa0"  # 单行/空框
-    # 真实屏幕底部 4 个实行：输入行 + 边框 + 两条状态行（无尾空行——
-    # capture 输出的尾换行是 split artifact，split_screen 会剔除）
-    bottom = [tail_line, "│ input border │", "─ status ─", "  ⏵⏵ mode line"]
-    return "\n".join([FILLER] + chat_lines + bottom)
-
-
-class FakeScreen:
-    """模拟 Claude Code pane：注入文本进输入框，Enter 提交为 ❯ 用户消息。
-
-    行为参数（模拟各类 TUI 竞态）：
-      drop_first_text : 第一次 send_text 的文本被重绘吞掉（不回显）
-      eat_first_enter : 第一个 Enter 被吞（文本滞留输入区）
-      compact_residual: 消息流常驻一条 ❯ /compact 命令行（内嵌唤醒词全文，
-                        复现 v0.2.2 生产事故的屏幕形态）
-      prefill         : 输入框预置残留脏文本（测 BSpace 清框）
-      no_busy         : 提交后不渲染 busy（测 ❯ 判据独立于 busy）
-      paste_collapse  : "expand"=大块注入折叠为 blob，再注入一次展开为明文
-                        （paste again to expand）；"never"=永远折叠（测兜底
-                        提交）。None=不折叠（正常路径）
+    behavior:
+      accept  注入的唤醒词即写入 transcript（提交即写——fast_time 下
+              wait_until 单次求值发生在 inject_line 之后，行为等价）
+      never   永不写（文本被吞 / Enter 全丢）
+      delayed round1 验证窗超时后才写入——挂在 watcher.dump_bottom 调用点
+              （round1 失败留痕的必经路径），模拟「忙完才提交、写入晚于
+              验证窗」（2026-09-17 backend 事故时序）
     """
 
-    def __init__(self, drop_first_text=False, eat_first_enter=False, compact_residual=False,
-                 prefill="", no_busy=False, paste_collapse=None):
-        self.drop_first_text = drop_first_text
-        self.eat_first_enter = eat_first_enter
-        self.no_busy = no_busy
-        self.paste_collapse = paste_collapse
-        self.text_count = 0
-        self.enter_count = 0
-        self.input = prefill
-        self.busy = False
-        self.submitted = []   # 提交的原文（断言清框纯净用）
-        self.messages = []    # 已提交的 ❯ 用户消息（渲染进消息流）
-        self.collapsed = False
-        self.pending = ""     # 折叠 blob 持有的原文
-        self.blob_seq = 0     # paste 编号（会话级递增计数器）
-        self.residual = (
-            [f"❯ /compact 保留任务状态（压缩完成后将收到唤醒词：{WORD}）"]
-            if compact_residual else []
-        )
+    def __init__(self, transcript: Path, behavior: str = "accept"):
+        self.transcript = transcript
+        self.behavior = behavior
+        self.text_calls = 0
+        self.enter_calls = 0
+        self.flushed = False
 
-    def frame(self) -> str:
-        # residual（压缩前的旧消息）在上，新提交的 ❯ 消息渲染在其下方——
-        # 真实屏幕时序，last_user_line 由此才能取到最新用户消息
-        if self.collapsed:
-            return frame_of_collapsed(self.blob_seq, self.residual + self.messages)
-        return frame_of(self.input, self.residual + self.messages, self.busy)
-
-    def bs(self, n: int) -> None:
-        self.input = self.input[: max(0, len(self.input) - n)]
+    def _maybe_write(self, text: str) -> None:
+        if self.transcript is None:
+            return  # 定位失败的会话：无从写入
+        if self.behavior == "accept" or (self.behavior == "delayed" and self.flushed):
+            write_entry(self.transcript, text)
 
     def send_text(self, pane, text):
-        self.text_count += 1
-        if self.drop_first_text and self.text_count == 1:
-            return  # 文本被 TUI 重绘吞掉：不回显
-        if self.paste_collapse and len(text) > INPUT_ONE_LINE:
-            # 大块瞬时文本 → Claude Code 按 paste 处理折叠为 blob（明文不上屏）
-            if self.collapsed and self.paste_collapse == "expand":
-                # 再粘贴一次 → 展开：blob 转明文（两份拼接，语义无害）
-                self.input = self.pending + text
-                self.pending = ""
-                self.collapsed = False
-            else:
-                self.collapsed = True
-                self.blob_seq += 1
-                self.pending = text
-            return
-        self.input = text
+        self.text_calls += 1
+        self._maybe_write(text)
 
     def send_key(self, pane, key):
-        if key == "C-u":
-            return  # 真 TUI 无清行语义（实测），fake 同样无操作
-        if key == "BSpace":
-            self.bs(1)
-            return
         if key == "Enter":
-            self.enter_count += 1
-            if self.eat_first_enter and self.enter_count == 1:
-                return  # Enter 被吞：文本滞留输入区
-            if self.collapsed:
-                # 折叠 blob 直接提交（2026-09-13 pane %2 用户手动 Enter 验证）：
-                # 消息流渲染为折叠形态消息行，提示消失
-                self.submitted.append(self.pending)
-                self.messages.append(f"❯ [Pasted text #{self.blob_seq}]")
-                self.pending = ""
-                self.collapsed = False
-                if not self.no_busy:
-                    self.busy = True
-                return
-            if not self.input:
-                return  # 空框 Enter：无操作
-            self.submitted.append(self.input)
-            self.messages.append(f"❯ {self.input}")
-            self.input = ""
-            if not self.no_busy:
-                self.busy = True
+            self.enter_calls += 1
+
+    def tmux(self, *args):
+        return ""  # 清框 BSpace 轰炸 / capture 均无害空串
 
 
 @pytest.fixture(autouse=True)
@@ -180,292 +97,210 @@ def fast_time(monkeypatch):
     monkeypatch.setattr(watcher, "wait_until", lambda pred, timeout, interval=0.2: pred())
 
 
-class Recorder:
-    """包装 send/send_key/tmux，统计注入与 Enter 次数，BSpace 轰炸转屏幕。"""
-
-    def __init__(self, screen, frames: list[str] | None = None):
-        self.screen = screen
-        self.frames = frames or []
-        self.text_calls = 0
-        self.enter_calls = 0
-
-    def send_text(self, pane, text):
-        self.text_calls += 1
-        self.screen.send_text(pane, text)
-
-    def send_key(self, pane, key):
-        if key == "Enter":
-            self.enter_calls += 1
-        self.screen.send_key(pane, key)
-
-    def tmux(self, *args):
-        # clear_input 的 BSpace 轰炸走 tmux 直调（真实环境单条命令发 1200 个）
-        if args[0] == "send-keys" and "BSpace" in args:
-            self.screen.bs(len(args) - 3)
-        return ""
-
-    def capture(self, pane):
-        if self.frames:
-            return self.frames.pop(0)  # 帧队列优先（精确驱动滞后类路径）
-        return self.screen.frame()
-
-
-def run_deliver(monkeypatch, tmp_path, screen, frames=None):
-    rec = Recorder(screen, frames)
+def run_deliver(monkeypatch, tmp_path, session):
     cfg = tmp_path / "task.json"
-    cfg.write_text(json.dumps({"pane": "%9", "wakeup_word": WORD, "state": "PENDING"}))
+    cfg.write_text(json.dumps({
+        "pane": "%9", "session_id": SID, "wakeup_word": WORD, "state": "PENDING",
+    }))
     task = watcher.Task(cfg)
-    monkeypatch.setattr(watcher, "send_text", rec.send_text)
-    monkeypatch.setattr(watcher, "send_key", rec.send_key)
-    monkeypatch.setattr(watcher, "tmux", rec.tmux)
-    monkeypatch.setattr(watcher, "capture", rec.capture)
-    ok = watcher.deliver_wakeup(task, "test reason")
-    return ok, task.cfg, rec
+    monkeypatch.setattr(watcher, "send_text", session.send_text)
+    monkeypatch.setattr(watcher, "send_key", session.send_key)
+    monkeypatch.setattr(watcher, "tmux", session.tmux)
+    monkeypatch.setattr(watcher, "capture", lambda pane: "screen")
+    monkeypatch.setattr(watcher, "find_transcript", lambda sid: session.transcript)
+    ok = watcher.deliver_wakeup(task, "%9", SID, "test reason")
+    return ok, task.cfg
 
 
 def test_happy_path(monkeypatch, tmp_path):
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, FakeScreen())
+    session = FakeSession(tmp_path / "proj" / f"{SID}.jsonl")
+    ok, cfg = run_deliver(monkeypatch, tmp_path, session)
     assert ok and cfg["state"] == "DONE"
-    assert rec.text_calls == 1 and rec.enter_calls == 1
-
-
-def test_eat_enter_nudge_no_resend(monkeypatch, tmp_path):
-    """第一个 Enter 被吞 → 只补 Enter，绝不重发文本。"""
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, FakeScreen(eat_first_enter=True))
-    assert ok and cfg["state"] == "DONE"
-    assert rec.text_calls == 1            # 文本只注入一次（防双发）
-    assert rec.enter_calls == 2           # 补了一次 Enter
-    assert "nudge 1" in (tmp_path / "watcher.log").read_text()
-
-
-def test_lost_text_full_reinject_with_dump(monkeypatch, tmp_path):
-    """注入文本被吞 → dump 现场留痕 → 轮前退避后重注成功。"""
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, FakeScreen(drop_first_text=True))
-    assert ok and cfg["state"] == "DONE"
-    assert rec.text_calls == 2            # 两轮全量注入
-    log = (tmp_path / "watcher.log").read_text()
-    assert "landed=False, bottom 10 lines dump:" in log  # 失败现场已留痕
-
-
-def test_residual_compact_cmd_no_false_sent(monkeypatch, tmp_path):
-    """回归（v0.2.2 生产事故）：压缩后消息流残留 ❯ /compact 命令行（内嵌
-    唤醒词全文）+ 第一个 Enter 被吞——残留不得触发已发送误判漏发，必须走
-    nudge 补发成功。"""
-    screen = FakeScreen(eat_first_enter=True, compact_residual=True)
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen)
-    assert ok and cfg["state"] == "DONE"
-    assert rec.text_calls == 1
-    assert rec.enter_calls == 2
-    log = (tmp_path / "watcher.log").read_text()
-    assert "nudge 1" in log
-
-
-def test_late_render_no_reinject(monkeypatch, tmp_path):
-    """Enter 已提交但 ❯ 消息渲染滞后：sent 验证期/nudge 首查都是中间帧
-    （tail 不在输入区、无新 ❯ 消息、残留行被 /compact 排除）→ 不 nudge、
-    不重注，延迟复检期判据出现 → DONE。
-
-    帧队列按 deliver_wakeup 的 capture 顺序精确驱动：
-      ⓪ 入口基线扫描 ① 轮前复查（不命中） ② prev_max 扫描
-      ③ 落地确认（文本在输入区，折行首行溢出到消息流）
-      ④ Enter 后 sent 验证（中间帧）
-      ⑤ nudge 首查（中间帧 → tail 不在输入区 → break 出 nudge）
-      ⑥ 延迟复检（❯ 新消息已渲染）
-    """
-    screen = FakeScreen(compact_residual=True)
-    frames = [
-        frame_of(),                                          # ⓪ 入口基线扫描
-        frame_of(chat_lines=["  ⎿ Compacted (ctrl+o"]),     # ① 轮前复查：不命中
-        frame_of(),                                          # ② prev_max 扫描
-        frame_of(input_text=WORD),                           # ③ 落地确认
-        frame_of(chat_lines=["  ⎿ Compacted (ctrl+o"]),     # ④ sent 验证：中间帧
-        frame_of(chat_lines=["  ⎿ Compacted (ctrl+o"]),     # ⑤ nudge 首查：中间帧
-        frame_of(chat_lines=["❯ " + WORD]),                 # ⑥ 新消息已渲染
-    ]
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen, frames=frames)
-    assert ok and cfg["state"] == "DONE"
-    assert "late render" in cfg["end_reason"]
-    assert rec.text_calls == 1            # 绝不重注（防误判双发）
-    assert rec.enter_calls == 1           # 也不补 Enter（tail 不在输入区）
-
-
-def test_sent_without_busy(monkeypatch, tmp_path):
-    """提交后 busy 永不出现——❯ 判据独立于 busy（v0.2.4：压缩后模型自动
-    继续也会 busy，busy 不能作成功信号，否则假 DONE 漏发）。"""
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, FakeScreen(no_busy=True))
-    assert ok and cfg["state"] == "DONE"
-    assert rec.text_calls == 1 and rec.enter_calls == 1
-
-
-def test_all_fail_reports_failed(monkeypatch, tmp_path):
-    """文本永远不落地 → 三轮后 FAILED（不假 DONE）。"""
-    class DeadScreen(FakeScreen):
-        def send_text(self, pane, text):
-            self.text_count += 1  # 一切注入都石沉大海
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, DeadScreen())
-    assert not ok and cfg["state"] == "FAILED"
-    assert rec.text_calls == 3            # 恰好三轮（退避 0/3/8s），不无限重试
-
-
-def test_clears_prefill_before_inject(monkeypatch, tmp_path):
-    """输入框有残留脏文本 → 注入前 BSpace 清框，提交内容纯净无拼接。
-
-    C-u 在 Claude Code 无清行语义（实测），旧版用 C-u 清框在框非空时会
-    把唤醒词拼接在残留后面发出脏消息。"""
-    screen = FakeScreen(prefill="上次失败滞留的脏文本残留")
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen)
-    assert ok and cfg["state"] == "DONE"
-    assert screen.submitted == [WORD]     # 提交的恰是纯唤醒词
-
-
-def test_paste_collapse_expand_path(monkeypatch, tmp_path):
-    """回归（v0.2.5 pane %2 生产事故）：busy 期注入被折叠为 [Pasted text #N]
-    blob（明文不上屏）→ 二次注入模拟「再粘贴一次」展开为明文 → 正常
-    Enter → ❯ 判据成功。"""
-    screen = FakeScreen(paste_collapse="expand")
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen)
-    assert ok and cfg["state"] == "DONE"
-    assert rec.text_calls == 2            # 注入 + 展开性重发
-    assert rec.enter_calls == 1
-    log = (tmp_path / "watcher.log").read_text()
-    assert "paste collapsed, re-send to expand" in log
-    assert screen.submitted == [WORD + WORD]  # 展开为两份拼接（语义无害）
-
-
-def test_paste_collapse_submit_fallback(monkeypatch, tmp_path):
-    """展开失败（永远折叠）→ 折叠 blob 直接 Enter 提交（用户 2026-09-13 手动
-    Enter 验证过的救法）→ collapsed_sent 编号判据成功。"""
-    screen = FakeScreen(paste_collapse="never")
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen)
-    assert ok and cfg["state"] == "DONE"
-    assert rec.text_calls == 2            # 注入 + 展开尝试（未生效）
-    assert rec.enter_calls == 1
-    log = (tmp_path / "watcher.log").read_text()
-    assert "paste collapsed, re-send to expand" in log
-    assert screen.submitted == [WORD]     # blob 持有的完整唤醒词被提交
+    assert session.text_calls == 1 and session.enter_calls == 1
+    assert cfg["end_reason"] == "test reason"
 
 
 def test_delayed_submit_recovered_pre_round(monkeypatch, tmp_path):
-    """round1 的 Enter 被 busy 排队：提交渲染晚于轮内全部验证窗口；
-    round2 退避后轮前复查命中 → 不重注（防双发）。"""
-    screen = FakeScreen()
-    frames = [
-        frame_of(),                                      # ⓪ 入口基线扫描
-        frame_of(),                                      # ① r1 轮前复查：不命中
-        frame_of(),                                      # ② r1 prev_max 扫描
-        frame_of(input_text=WORD),                       # ③ r1 落地确认
-        frame_of(),                                      # ④ r1 sent 验证：无新消息
-        frame_of(),                                      # ⑤ r1 nudge 首查 → break
-        frame_of(),                                      # ⑥ r1 late recheck：False
-        frame_of(chat_lines=["❯ " + WORD]),             # ⑦ r2 轮前复查：命中
-    ]
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen, frames=frames)
+    """round1 的 Enter 被 busy 排队：transcript 条目写入晚于轮内验证窗；
+    round2 退避后轮前复查命中 → 不重注（防双发）。写入时机挂在
+    dump_bottom（round1 失败留痕必经点，时序上恰在验证窗超时后）。"""
+    session = FakeSession(tmp_path / "proj" / f"{SID}.jsonl", behavior="delayed")
+    real_dump = watcher.dump_bottom
+
+    def dump_then_flush(task, pane):
+        session.flushed = True
+        write_entry(session.transcript, WORD)  # 忙完提交：验证窗超时后才写入
+        real_dump(task, pane)
+
+    monkeypatch.setattr(watcher, "dump_bottom", dump_then_flush)
+    ok, cfg = run_deliver(monkeypatch, tmp_path, session)
     assert ok and cfg["state"] == "DONE"
     assert "delayed confirm" in cfg["end_reason"]
-    assert rec.text_calls == 1            # 未重注（上轮已成功，只是渲染晚）
-    assert rec.enter_calls == 1
+    assert session.text_calls == 1            # 未重注（上轮已送达，写入晚）
+    assert session.enter_calls == 1
 
 
-def test_entry_compact_blob_no_false_done(monkeypatch, tmp_path):
-    """入口屏幕已有折叠提交的 compact blob 消息行（paste_collapse 全链路：
-    compact_cmd 同样被折叠提交）→ round1 轮前复查不得把它误判为唤醒词已
-    送达（假 DONE，e2e 实战抓出）——须走正常折叠展开路径投递。"""
-    screen = FakeScreen(paste_collapse="expand")
-    screen.messages.append("❯ [Pasted text #1]")   # compact blob 已提交
-    ok, cfg, rec = run_deliver(monkeypatch, tmp_path, screen)
+def test_all_fail_reports_failed(monkeypatch, tmp_path):
+    """transcript 条目永不出现（文本反复被吞）→ 三轮重注后 FAILED（不假 DONE）。"""
+    session = FakeSession(tmp_path / "proj" / f"{SID}.jsonl", behavior="never")
+    ok, cfg = run_deliver(monkeypatch, tmp_path, session)
+    assert not ok and cfg["state"] == "FAILED"
+    assert session.text_calls == 3            # 恰好三轮（退避 0/3/8s），不无限重试
+    log = (tmp_path / "watcher.log").read_text()
+    assert "bottom 10 lines dump" in log      # 失败现场留痕
+
+
+def test_residual_entries_no_false_sent(monkeypatch, tmp_path):
+    """回归（v0.2.2 事故的 transcript 形态）：基线前已有 /compact 命令条目
+    （内嵌唤醒词全文）+ isCompactSummary 摘要条目（复述唤醒词）——轮前复查
+    不得误判「已送达」，必须走真实投递。"""
+    transcript = tmp_path / "proj" / f"{SID}.jsonl"
+    write_entry(transcript, f"/compact 保留任务状态（唤醒词：{WORD}）")
+    write_entry(transcript, f"This session is being continued… 摘要含唤醒词：{WORD}",
+                compact_summary=True)
+    session = FakeSession(transcript)
+    ok, cfg = run_deliver(monkeypatch, tmp_path, session)
     assert ok and cfg["state"] == "DONE"
-    assert rec.text_calls == 2            # 走折叠展开路径，不是复查短路
+    assert session.text_calls == 1            # 真实注入了一次（不是复查短路）
     assert "delayed confirm" not in cfg["end_reason"]
 
 
-# ---- sent_signal 判据直测（不跑完整投递流程）----
-
-def test_sent_signal_ignores_compact_residual():
-    """v0.2.2 事故形态直测：残留 ❯ /compact 行内嵌唤醒词全文（含 head），
-    且 tail 不在输入区——裸 head 检测必误判，/compact 前缀排除必须挡住。"""
-    frame = frame_of(chat_lines=[f"❯ /compact 保留任务状态（唤醒词：{WORD}）"])
-    assert not watcher.sent_signal(frame, HEAD, TAIL)
-
-
-def test_sent_signal_accepts_new_message():
-    frame = frame_of(chat_lines=["  ⎿ Compacted (ctrl+o", f"❯ {WORD}"])
-    assert watcher.sent_signal(frame, HEAD, TAIL)
+def test_no_transcript_honest_fail(monkeypatch, tmp_path):
+    """transcript 定位失败（异常环境）→ 无送达判据 → 三轮后诚实 FAILED。"""
+    session = FakeSession(tmp_path / "proj" / f"{SID}.jsonl", behavior="accept")
+    session.transcript = None                 # find_transcript 返回 None
+    ok, cfg = run_deliver(monkeypatch, tmp_path, session)
+    assert not ok and cfg["state"] == "FAILED"
+    log = (tmp_path / "watcher.log").read_text()
+    assert "transcript not found" in log
 
 
-def test_sent_signal_blocked_by_tail_in_input():
-    """折行守卫：文本仍在输入框（尚未提交）时，即使消息流有含 head 的
-    ❯ 行（输入框首行溢出/残留）也绝不判成功。"""
-    frame = frame_of(input_text=WORD, chat_lines=[f"❯ {WORD}"])
-    assert not watcher.sent_signal(frame, HEAD, TAIL)
+def test_run_happy_with_hooks(monkeypatch, tmp_path):
+    """run 主干：/compact 注入 → pre/post 标记（注入后写入——模拟真实
+    hook 由 Claude Code 在接受命令/完成压缩时触发，而非预置）→
+    INJECTING 一次成功 → COMPACTING → deliver 成功（不重注 /compact）。"""
+    hook_root = tmp_path / "hooks"
+    monkeypatch.setattr(watcher, "HOOK_ROOT", hook_root)
+    transcript = tmp_path / "proj" / f"{SID}.jsonl"
+    write_entry(transcript, "chat history line")   # 基线前的历史
+
+    def write_marker(event: str) -> None:
+        hook_root.mkdir(parents=True, exist_ok=True)
+        (hook_root / f"{SID}.{event}.json").write_text(json.dumps(
+            {"event": event, "ts": time.time() + 3600,   # 未来值确保新于 watcher_start
+             "transcript_path": str(transcript)}))
+
+    session = FakeSession(transcript)
+    orig_send_text = session.send_text
+
+    def send_text_and_fire_hooks(pane, text):
+        orig_send_text(pane, text)
+        if text.startswith("/compact"):
+            write_marker("pre")   # Claude Code 接受命令 → PreCompact
+            write_marker("post")  # fast_time 下压缩即时完成 → PostCompact
+
+    cfg = tmp_path / "task.json"
+    cfg.write_text(json.dumps({
+        "pane": "%9", "session_id": SID, "compact_cmd": f"/compact xxx（唤醒词：{WORD}）",
+        "wakeup_word": WORD, "settle_seconds": 0, "state": "PENDING",
+    }))
+    task = watcher.Task(cfg)
+    monkeypatch.setattr(watcher, "send_text", send_text_and_fire_hooks)
+    monkeypatch.setattr(watcher, "send_key", session.send_key)
+    monkeypatch.setattr(watcher, "tmux", session.tmux)
+    monkeypatch.setattr(watcher, "capture", lambda pane: "screen")
+    monkeypatch.setattr(watcher, "pane_alive", lambda pane: True)
+    monkeypatch.setattr(watcher, "find_transcript", lambda sid: transcript)
+    watcher.run(task)
+
+    assert task.cfg["state"] == "DONE"
+    assert task.cfg["end_reason"] == "compacted confirmed"
+    assert session.text_calls == 2            # /compact 一次 + 唤醒词一次，无重注
+    log = (tmp_path / "watcher.log").read_text()
+    assert "compaction accepted (PreCompact hook)" in log
+    assert "compaction done (PostCompact hook)" in log
 
 
-def test_in_input_single_line_box():
-    """短唤醒词不折行（实测 175 显示宽在 179 宽 pane 单行）：❯+nbsp 与
-    tail 同行仍算在框；提交后的消息行（❯+普通空格）不算。"""
-    frame = frame_of(input_text="[短] 测试 tail")            # 单行输入框
-    assert watcher.in_input(frame, "试 tail")
-    frame2 = frame_of(input_text="[短] 测试 tail")           # nbsp 前缀命中
-    assert watcher.in_input(frame2, "[短]")
+# ---- scan_transcript 判据直测 ----
+
+def test_scan_hits_head_in_new_user_entry(tmp_path):
+    p = tmp_path / "t.jsonl"
+    write_entry(p, "chat history")
+    base = 1
+    write_entry(p, WORD)
+    assert watcher.scan_transcript(p, base, head=HEAD) == WORD
 
 
-def test_collapsed_sent_forms():
-    """collapsed_sent 三形态：预览态（提示在屏）不算提交；提交态（提示消失 +
-    编号递增的 blob 消息行）算；历史 blob（编号 ≤ 基线）不算。"""
-    preview = frame_of_collapsed(blob_seq=7)
-    assert not watcher.collapsed_sent(preview, 6)      # 预览态：提示在屏
-    submitted = frame_of(chat_lines=["❯ [Pasted text #7]"])
-    assert watcher.collapsed_sent(submitted, 6)        # 新编号 blob 消息行
-    assert not watcher.collapsed_sent(submitted, 7)    # 历史 blob：编号不递增
+def test_scan_excludes_compact_cmd_and_summary(tmp_path):
+    """compact_cmd 条目（/compact 前缀，内嵌唤醒词全文）与 isCompactSummary
+    摘要（复述唤醒词）都不是唤醒词送达。"""
+    p = tmp_path / "t.jsonl"
+    write_entry(p, "chat history")
+    base = 1
+    write_entry(p, f"/compact 保留任务状态（唤醒词：{WORD}）")
+    write_entry(p, f"摘要复述：{WORD}", compact_summary=True)
+    assert watcher.scan_transcript(p, base, head=HEAD) is None
 
 
-def test_deliver_state_collapsed():
-    """折叠态分流：明文不上屏但提示在屏 → 'collapsed'（tail 判据永假，
-    必须走专门路径）。"""
-    assert watcher.deliver_state(frame_of_collapsed(blob_seq=1), TAIL) == "collapsed"
-    assert watcher.deliver_state(frame_of(input_text=WORD), TAIL) == "text"
-    assert watcher.deliver_state(frame_of(), TAIL) is None
+def test_scan_baseline_excludes_history(tmp_path):
+    """基线之前的历史条目（含真实唤醒词——上轮已送达）不参与本轮判定。"""
+    p = tmp_path / "t.jsonl"
+    write_entry(p, WORD)                      # 历史：上轮送达的唤醒词
+    assert watcher.scan_transcript(p, 1, head=HEAD) is None
 
+
+def test_scan_list_content(tmp_path):
+    """content 为 list 型（多段 text block）时拼接匹配。"""
+    p = tmp_path / "t.jsonl"
+    p.write_text(json.dumps({
+        "type": "user", "message": {"role": "user", "content": [
+            {"type": "text", "text": WORD[:20]}, {"type": "text", "text": WORD[20:]},
+        ]},
+    }) + "\n")
+    assert watcher.scan_transcript(p, 0, head=HEAD) == WORD
+
+
+def test_scan_compact_summary_mode(tmp_path):
+    """compact_summary 模式：找 isCompactSummary 条目（压缩完成兜底信号）。
+    lines[baseline:] 语义：前 baseline 行是历史，基线=文件总行数。"""
+    p = tmp_path / "t.jsonl"
+    write_entry(p, "summary text", compact_summary=True)   # 行 0：历史摘要
+    write_entry(p, "chat history")                         # 行 1：基线锚点
+    assert watcher.scan_transcript(p, 2, compact_summary=True) is None  # 基线后无
+    write_entry(p, "new summary", compact_summary=True)    # 行 2：本轮压缩
+    assert watcher.scan_transcript(p, 2, compact_summary=True) is not None
+
+
+# ---- hook 标记直测 ----
+
+def test_read_hook_rejects_stale(tmp_path, monkeypatch):
+    """上次压缩遗留的标记（ts 早于本次 watcher 启动）不得当作本次信号。"""
+    monkeypatch.setattr(watcher, "HOOK_ROOT", tmp_path)
+    marker = tmp_path / f"{SID}.pre.json"
+    marker.write_text(json.dumps({"event": "PreCompact", "ts": 100.0}))
+    assert watcher.read_hook(SID, "pre", watcher_start=200.0) is None    # 陈旧
+    marker.write_text(json.dumps({"event": "PreCompact", "ts": 300.0}))
+    assert watcher.read_hook(SID, "pre", watcher_start=200.0) is not None
+
+
+def test_clear_stale_hooks_removes_markers(tmp_path, monkeypatch):
+    monkeypatch.setattr(watcher, "HOOK_ROOT", tmp_path)
+    for event in ("pre", "post"):
+        (tmp_path / f"{SID}.{event}.json").write_text("{}")
+    watcher.clear_stale_hooks(SID, time.time())
+    assert not (tmp_path / f"{SID}.pre.json").exists()
+    assert not (tmp_path / f"{SID}.post.json").exists()
+
+
+# ---- wait_until 语义直测（v0.2.6 mock 失真教训，跨版本保留）----
 
 def test_wait_until_returns_pred_value(monkeypatch):
     """wait_until 直测（真实实现，不受 fast_time mock）：必须返回 pred()
-    真实返回值而非布尔——2026-09-13 真实试用抓出 v0.2.5 mock 失真：循环内
-    `return True` 把 deliver_state 三态布尔化，`state == "collapsed"` 在
-    生产永不匹配，折叠展开主路成死代码；单测 mock 恰返回 pred() 值，
-    语义失真未被测试网拦住。"""
+    真实返回值而非布尔——v0.2.5 真实试用抓出循环内 `return True` 把三态
+    布尔化、单测 mock 恰返回 pred() 值的语义失真。"""
     monkeypatch.setattr(watcher, "wait_until", _REAL_WAIT_UNTIL)
     monkeypatch.setattr(watcher.time, "sleep", lambda s: None)
-    # 首圈命中：返回谓词值本身（"collapsed"/"text"），不是 True
-    assert watcher.wait_until(lambda: "collapsed", 1.0, 0.01) == "collapsed"
-    assert watcher.wait_until(lambda: "text", 1.0, 0.01) == "text"
-    # 谓词恒假：超时返回最后一次谓词值（None），同样不被布尔化成 False
+    assert watcher.wait_until(lambda: "hit", 1.0, 0.01) == "hit"
     ticks = iter([0.0, 100.0])  # deadline=1.0；首查 0<1 进循环体，复查 100≥1 退出
     monkeypatch.setattr(watcher.time, "time", lambda: next(ticks))
     assert watcher.wait_until(lambda: None, 1.0, 0.01) is None
-
-
-def test_wrapped_message_tail_row_not_in_input():
-    """v0.2.6 e2e（120 宽 pane）抓出的潜伏漏洞：提交消息折行续行（无前缀、
-    含 tail）落进底部窗口且在空输入框 ❯\xa0 行上方——旧判据「无前缀+
-    含 tail」把它误当输入框内容 → sent 永假 → 三轮重发双发（179 宽下
-    唤醒词恰好单行不折行，漏洞被宽度巧合掩盖，WSL 重启后 pane 变 120
-    宽才暴露）。tail 行在提示符上方不得算在框。"""
-    frame = "\n".join([
-        "  ⎿ Compacted (ctrl+o",
-        f"❯ {WORD}",
-        WORD[-30:],                                # 提交消息的折行续行：无前缀、含 tail
-        "  (esc to interrupt while thinking…)",
-        "❯\xa0",                                   # 空输入框（提交后框已清空）
-        "─ status ─",
-    ])
-    assert not watcher.in_input(frame, TAIL)
-    assert watcher.sent_signal(frame, HEAD, TAIL)
-
-
-def test_window_shift_message_row_not_in_input():
-    """窗口错位（消息流内容少时——压缩刚完成只有摘要几行——新消息落进底部
-    N 行窗口）：消息行含 tail 但前缀是 ❯+普通空格 → 不算在框 → sent 判据
-    不被拦截（e2e 实战教训：按区域+裸子串判定 → FAILED+三轮重注双发）。"""
-    # 手动构造 5 行帧：❯ 消息行恰在倒数第 4 行（输入区窗口内）
-    frame = "\n".join(["  ⎿ Compacted (ctrl+o", f"❯ {WORD}", "│ border │", "─ status ─", "  mode"])
-    assert not watcher.in_input(frame, TAIL)
-    assert watcher.sent_signal(frame, HEAD, TAIL)
