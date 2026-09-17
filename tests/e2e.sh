@@ -1,13 +1,16 @@
 #!/bin/bash
-# e2e.sh — 在真实 tmux pane 里对 fake_claude 跑完整 watcher 流程（v0.3：
-# hooks + transcript 信号源）。
+# e2e.sh — 在真实 tmux pane 里对 fake_claude 跑完整 watcher 流程（v0.3.2：
+# hooks + transcript 信号源，pane cwd 锚定）。
 #
 # 用法: tests/e2e.sh [mode]
-#   mode: normal(默认) | swallow | eat_enter | lost_text | paste_collapse | busy_defer
+#   mode: normal(默认) | swallow | eat_enter | lost_text | paste_collapse |
+#         busy_defer | switch_sid
 #
 # 链路全真：真实 tmux send-keys / 独立 watcher 进程 / 真实文件系统
 # （transcript jsonl + hook 标记文件，路径经 COMPACTME_PROJECTS_ROOT 隔离），
 # fake_claude 只替代 Claude Code 本体（保真点见其 docstring）。
+# 会话定位走 COMPACTME_CWD=/e2e → projects 子目录 "-e2e"（v0.3.2 锚点），
+# 不依赖 pane 进程树反查（fake 不是真 Claude Code 进程）。
 set -u
 MODE="${1:-normal}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,10 +18,10 @@ S="cm-e2e"
 RUN="/tmp/compactme-e2e/run-$$"
 SID="e2e-$$"
 PROJROOT="/tmp/compactme-e2e/projects"
-TRANSCRIPT="$PROJROOT/e2e/$SID.jsonl"
-mkdir -p "$RUN" "$PROJROOT/e2e"
+TRANSCRIPT="$PROJROOT/-e2e/$SID.jsonl"
+mkdir -p "$RUN" "$PROJROOT/-e2e"
 : > /tmp/compactme-e2e/received.log
-rm -f "$TRANSCRIPT" /tmp/compactme/hooks/"$SID".pre.json /tmp/compactme/hooks/"$SID".post.json
+rm -f "$PROJROOT/-e2e/$SID"*.jsonl /tmp/compactme/hooks/"$SID"*.json
 
 tmux kill-session -t "$S" 2>/dev/null
 tmux new-session -d -s "$S" -x 120 -y 40 \
@@ -46,7 +49,7 @@ cat > "$RUN/task.json" <<EOF
 }
 EOF
 
-COMPACTME_PROJECTS_ROOT="$PROJROOT" \
+COMPACTME_PROJECTS_ROOT="$PROJROOT" COMPACTME_CWD="/e2e" COMPACTME_SESSION_ID="$SID" \
   python3 "$ROOT/mcp/watcher.py" "$RUN/task.json" >/dev/null 2>&1 &
 
 STATE=""
@@ -57,12 +60,17 @@ for _ in $(seq 1 120); do
 done
 
 END_REASON=$(python3 -c "import json;print(json.load(open('$RUN/task.json')).get('end_reason',''))" 2>/dev/null)
+# switch_sid 模式：压缩把写入切到 continuation 新文件（新 sid），断言随之
+# 指向新文件；hook 标记也写新 sid 名（v0.3.2 事故形态）
+SW=""; [ "$MODE" = "switch_sid" ] && SW="-sw"
+ASSERT_T="${TRANSCRIPT%.jsonl}$SW.jsonl"
+HOOK_SID="$SID$SW"
 # 唤醒词计数须排除 compact_cmd 内嵌的唤醒词全文（compact 提交行同串命中）
 N_WAKE=$(grep "续任务：e2e 验证" /tmp/compactme-e2e/received.log | grep -vc "|/compact" || true)
 N_COMPACT=$(grep -c "^RECV|.*|/compact" /tmp/compactme-e2e/received.log || true)
 # transcript 层断言（与 watcher 判据同语义：user 条目以唤醒词开头、非摘要、
 # 非 /compact 前缀——compact_cmd 内嵌全文与摘要复述都不算送达）
-T_WAKE=$(python3 - "$TRANSCRIPT" <<'PYEOF'
+T_WAKE=$(python3 - "$ASSERT_T" <<'PYEOF'
 import json, sys
 n = 0
 try:
@@ -81,9 +89,9 @@ for ln in lines:
 print(n)
 PYEOF
 )
-T_COMPACT=$(grep -c '"content": "/compact' "$TRANSCRIPT" 2>/dev/null || true)
-T_SUMMARY=$(grep -c "isCompactSummary.: true" "$TRANSCRIPT" 2>/dev/null || true)
-H_POST=$([ -f /tmp/compactme/hooks/"$SID".post.json ] && echo 1 || echo 0)
+T_COMPACT=$(grep -c '"content": "/compact' "$ASSERT_T" 2>/dev/null || true)
+T_SUMMARY=$(grep -c "isCompactSummary.: true" "$ASSERT_T" 2>/dev/null || true)
+H_POST=$([ -f /tmp/compactme/hooks/"$HOOK_SID".post.json ] && echo 1 || echo 0)
 
 echo "── e2e[$MODE] pane=$PANE state=$STATE reason=$END_REASON"
 echo "   compact 提交 $N_COMPACT 次 | 唤醒词提交 $N_WAKE 次 | transcript: 唤醒词(前缀判据) $T_WAKE / compact $T_COMPACT / 摘要 $T_SUMMARY | post hook $H_POST"
@@ -104,6 +112,13 @@ case "$MODE" in
     [ "$N_COMPACT" -ge 2 ] || { echo "❌ compact $N_COMPACT 次（swallow 应重试 ≥2）"; FAIL=1; }
     [ "$T_COMPACT" -eq "$N_COMPACT" ] || { echo "❌ transcript compact 条目 $T_COMPACT ≠ RECV $N_COMPACT"; FAIL=1; }
     [ "$T_SUMMARY" -eq 1 ] || { echo "❌ 摘要 $T_SUMMARY 条（被吞的不得产生摘要，应恰 1）"; FAIL=1; } ;;
+  switch_sid)
+    # v0.3.2 事故形态回归：压缩切 sid/文件后不得误判重发（事故现场：双发
+    # /compact + 唤醒词空转）；唤醒词必须落 continuation 新文件
+    [ "$N_COMPACT" -eq 1 ] || { echo "❌ compact $N_COMPACT 次（sid 切换后误判重发）"; FAIL=1; }
+    OLD_HITS=$(grep -c "续任务" "$TRANSCRIPT" 2>/dev/null || true)
+    OLD_HITS=${OLD_HITS:-0}   # ugrep 对不存在文件输出空（GNU 输出 0），兜底
+    [ "$OLD_HITS" -eq 0 ] || { echo "❌ 唤醒词痕迹出现在旧 transcript（应只落新文件）"; FAIL=1; } ;;
   *)
     [ "$N_COMPACT" -eq 1 ] || { echo "❌ compact $N_COMPACT 次（应 1，防双发）"; FAIL=1; } ;;
 esac

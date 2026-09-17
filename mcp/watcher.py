@@ -11,6 +11,17 @@
   compacted 完成 = PostCompact hook 标记；兜底 = transcript isCompactSummary
   唤醒词送达    = transcript 新增 user 条目含 head 且非 /compact 前缀
 
+v0.3.2（2026-09-18 第三次试用事故）：锚点从 session_id 换成 pane cwd。
+压缩时 Claude Code 会开新的 continuation transcript（**新 session id 新文件**），
+pane 进程 environ 的 CLAUDE_CODE_SESSION_ID 固化在启动值永不更新——v0.3.1 的
+一次性反查在上次压缩后即失效（盯 392726e5，标记/transcript 实际在 b1935f68
+名下），双通道全盲 → 90s×3 重注双发。修复：
+  transcript = claude 进程 cwd → projects 子目录 → mtime 最新 jsonl（活跃文件，
+              压缩切文件自动跟上）
+  hook 标记  = 扫描式匹配：ts > watcher_start 且 transcript_path 父目录 ==
+              本 pane 的 projects 目录（不预知 session id）
+  session_id 降级为信息性记录，不参与任何判定。
+
 transcript 优势（2026-09-17 事故 transcript 铁证）：写入先于 TUI 渲染 10s+；
 折叠 paste 提交后记录完整原文（屏幕只显 [Pasted text #N]）——屏幕雷区全免疫。
 
@@ -140,51 +151,110 @@ def kill_previous(task: Task) -> None:
 
 # ---- hook 标记通道（compacting/compacted 的稳定信号）----
 
-def hook_path(session_id: str, event: str) -> Path:
-    """event: 'pre' | 'post'。标记文件名与 hooks/compact_hook.py 约定一致。"""
-    return HOOK_ROOT / f"{session_id}.{event}.json"
+def scan_hook(event: str, watcher_start: float, projects_dir: str) -> dict | None:
+    """扫描式匹配 hook 标记，不预知 session id。
 
-
-def clear_stale_hooks(session_id: str, watcher_start: float) -> None:
-    """删除本 session 的陈旧 hook 标记（上次压缩遗留）。
-
-    双保险：删除 + 时序校验（ts 早于 watcher 启动的标记视为陈旧）——
-    删除失败/竞态时序校验兜底。"""
-    for event in ("pre", "post"):
-        p = hook_path(session_id, event)
-        if p.exists():
-            try:
-                p.unlink()
-                continue
-            except OSError:
-                pass
-        # 删不掉的留给 read_hook 的时序校验拒绝
-
-
-def read_hook(session_id: str, event: str, watcher_start: float) -> dict | None:
-    """读 hook 标记；陈旧标记（ts 早于 watcher 启动）返回 None。"""
-    p = hook_path(session_id, event)
-    if not p.exists():
-        return None
+    v0.3.2 事故教训：hook 用**压缩时刻的真实 session id** 命名标记文件，
+    而 compact 会切换 session id——watcher 无从预知文件名（盯 392726e5，
+    标记实际写在 b1935f68 名下）。改扫 HOOK_ROOT 全部 *.<event>.json：
+      ts > watcher_start      陈旧标记（上次压缩遗留/同名覆盖前的旧值）天然过滤
+      transcript_path 父目录名 == 本 pane 的 projects 目录   跨会话区分
+    返回 ts 最新一条（含权威 transcript_path）。同 cwd 双会话同时压缩会串
+    （后果仅提前确认压缩开始，deliver 判据独立，可接受）。"""
+    best: dict | None = None
     try:
-        data = json.loads(p.read_text())
-    except (OSError, json.JSONDecodeError):
+        paths = list(HOOK_ROOT.glob(f"*.{event}.json"))
+    except OSError:
         return None
-    if float(data.get("ts", 0)) < watcher_start:
+    for p in paths:
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        try:
+            ts = float(data.get("ts", 0))
+        except (TypeError, ValueError):
+            continue
+        if ts <= watcher_start:
+            continue
+        if Path(str(data.get("transcript_path", ""))).parent.name != projects_dir:
+            continue
+        if best is None or ts > float(best.get("ts", 0)):
+            best = data
+    return best
+
+
+# ---- pane 会话定位（v0.3.2：cwd 锚定）----
+
+def _readlink(path: str) -> str | None:
+    try:
+        return os.readlink(path)
+    except OSError:
         return None
-    return data
+
+
+def pane_context(pane: str) -> tuple[str | None, str | None]:
+    """BFS pane 进程树找 claude 进程，返回 (session_id, cwd)。
+
+    session_id 仅信息性记录（environ 固化在进程启动值、压缩切换后即过期，
+    v0.3.2 起不参与任何判定）；cwd 取 claude 进程的 /proc/<pid>/cwd——
+    shell 的 cwd 可能被用户 cd 走，claude 进程的才是会话目录。
+    COMPACTME_CWD / COMPACTME_SESSION_ID env 可覆盖（e2e/单测隔离）。"""
+    override = os.environ.get("COMPACTME_CWD")
+    if override:
+        return os.environ.get("COMPACTME_SESSION_ID"), override
+    root = tmux("display-message", "-p", "-t", pane, "#{pane_pid}").strip()
+    if not root:
+        return None, None
+    seen: set[str] = set()
+    queue = [root]
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except OSError:
+            env = []
+        sid = None
+        for e in env:
+            if e.startswith(b"CLAUDE_CODE_SESSION_ID="):
+                sid = e.decode("utf-8", "ignore").split("=", 1)[1]
+                break
+        if sid:
+            return sid, _readlink(f"/proc/{pid}/cwd")
+        queue.extend(_child_pids(pid))
+    return None, None
+
+
+def projects_dir_name(cwd: str) -> str:
+    """会话 cwd → projects 子目录名（Claude Code 规则：/ 换 -）。
+    /home/remedy/x → -home-remedy-x"""
+    return cwd.replace("/", "-")
+
+
+def active_transcript(projects_dir: str) -> Path | None:
+    """projects 子目录下 mtime 最新的 jsonl = 活跃 transcript。
+
+    压缩切换 transcript 文件后（v0.3.2 事故形态），新文件必然是最近写入
+    的——mtime 排序自动跟上，不依赖任何 session id。"""
+    d = PROJECTS_ROOT / projects_dir
+    if not d.is_dir():
+        return None
+    best: Path | None = None
+    best_mtime = -1.0
+    for p in d.glob("*.jsonl"):
+        try:
+            m = p.stat().st_mtime
+        except OSError:
+            continue
+        if m > best_mtime:
+            best, best_mtime = p, m
+    return best
 
 
 # ---- transcript 通道（压缩完成兜底 + 唤醒词送达确认）----
-
-def find_transcript(session_id: str) -> Path | None:
-    """按 session_id 定位 transcript（~/.claude/projects/*/<sid>.jsonl）。"""
-    if PROJECTS_ROOT.is_dir():
-        hits = sorted(PROJECTS_ROOT.glob(f"*/{session_id}.jsonl"))
-        if hits:
-            return hits[0]
-    return None
-
 
 def transcript_lines(path: Path | None) -> int:
     """transcript 行数（基线锚点）。文件不存在/不可读返回 0。"""
@@ -262,15 +332,17 @@ def inject_line(pane: str, text: str) -> None:
     send_key(pane, "Enter")
 
 
-def deliver_wakeup(task: Task, pane: str, session_id: str, reason: str) -> bool:
+def deliver_wakeup(task: Task, pane: str, projects_dir: str, reason: str) -> bool:
     """投递唤醒词：注入+Enter 连发 → transcript 出现新增 user 条目含 head。
 
-    轮前复查上轮延迟提交（busy 期 Enter 排队、忙完才写入 transcript）；
-    三轮退避重注；失败 FAILED 落盘 + dump 留痕。"""
+    transcript 进门重新定位（压缩可能已切换文件——v0.3.2 事故形态）：
+    基线锚在压缩后的活跃文件上，唤醒词条目必在其后。轮前复查上轮延迟
+    提交（busy 期 Enter 排队、忙完才写入 transcript）；三轮退避重注；
+    失败 FAILED 落盘 + dump 留痕。"""
     word = task.cfg["wakeup_word"]
     head = wakeup_head(word)
-    transcript = find_transcript(session_id)
-    task.log(f"wakeup transcript: {transcript} (session {session_id[:8]}…)")
+    transcript = active_transcript(projects_dir)
+    task.log(f"wakeup transcript: {transcript}")
     if transcript is None:
         task.log("transcript not found — deliver 确认降级为纯重试（无送达判据）")
 
@@ -315,49 +387,19 @@ def _child_pids(pid: str) -> list[str]:
         return []
 
 
-def session_id_from_pane(pane: str) -> str | None:
-    """从 pane 进程树反查 claude 进程的 CLAUDE_CODE_SESSION_ID。
-
-    消除对 MCP server 版本的依赖：MCP server 是长驻进程、代码在启动时固化
-    （/reload-plugins 不重启 plugin MCP server），而 watcher 每次现读磁盘——
-    2026-09-18 生产事故：老 MCP server 不写 session_id，新 watcher KeyError
-    崩溃、压缩全程未执行。反查让任何版本的 MCP server 都兼容新 watcher。
-    （hook 标记不受此影响：hook 每次事件由 Claude Code 主进程直接 spawn，
-    永远跑磁盘最新代码。）"""
-    root = tmux("display-message", "-p", "-t", pane, "#{pane_pid}").strip()
-    if not root:
-        return None
-    seen: set[str] = set()
-    queue = [root]
-    while queue:
-        pid = queue.pop(0)
-        if pid in seen:
-            continue
-        seen.add(pid)
-        try:
-            env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-        except OSError:
-            env = []
-        for e in env:
-            if e.startswith(b"CLAUDE_CODE_SESSION_ID="):
-                return e.decode("utf-8", "ignore").split("=", 1)[1]
-        queue.extend(_child_pids(pid))
-    return None
-
-
 def run(task: Task) -> None:
     pane = task.cfg["pane"]
-    # session_id 双来源：task.json（新 MCP server 写入）→ pane 进程树反查
-    # （老 MCP server 兼容，2026-09-18 生产事故的根治）；两者都无则诚实退出
-    session_id = task.cfg.get("session_id") or session_id_from_pane(pane)
-    if not session_id:
-        task.update(state="ABORTED", end_reason="session_id unavailable")
-        task.log("ABORTED: no session_id in task.json and pane process scan "
-                 "found no CLAUDE_CODE_SESSION_ID (not a Claude Code pane?)")
+    # 会话定位（v0.3.2）：claude 进程 cwd → projects 子目录。session_id 仅
+    # 信息性记录——environ 固化在启动值、压缩切换后即过期，不参与判定
+    session_id, cwd = pane_context(pane)
+    if not cwd:
+        task.update(state="ABORTED", end_reason="no claude process in pane")
+        task.log("ABORTED: pane process scan found no CLAUDE_CODE_SESSION_ID "
+                 "(not a Claude Code pane?)")
         return
-    if "session_id" not in task.cfg:
+    projects_dir = projects_dir_name(cwd)
+    if session_id and task.cfg.get("session_id") != session_id:
         task.update(session_id=session_id)
-        task.log(f"session_id recovered from pane process tree: {session_id[:8]}…")
     settle = float(task.cfg.get("settle_seconds", 6))
     global_deadline = float(task.cfg.get("global_timeout", 600))
     retries = int(task.cfg.get("retry_limit", 2))
@@ -365,24 +407,25 @@ def run(task: Task) -> None:
     watcher_start = time.time()
     kill_previous(task)
     task.update(watcher_pid=os.getpid(), state="WAIT_SETTLE")
-    task.log(f"watcher start pid={os.getpid()} pane={pane} session={session_id[:8]}…")
-
-    clear_stale_hooks(session_id, watcher_start)
+    task.log(f"watcher start pid={os.getpid()} pane={pane} cwd={cwd} "
+             f"projects_dir={projects_dir} session={session_id[:8] if session_id else '?'}…")
 
     t0 = time.time()
     time.sleep(settle)  # 等模型收尾总结、TUI 回到输入态
 
-    transcript = find_transcript(session_id)
+    transcript = active_transcript(projects_dir)
+    task.log(f"active transcript: {transcript}")
     # 基线在**注入 /compact 之前**取：本轮压缩的 isCompactSummary 条目落在
-    # 新增区（多 attempt 重注也全在基线后）；同 session 上次压缩的历史
-    # 摘要条目在基线前，天然不参与判定
+    # 新增区（多 attempt 重注也全在基线后）；本会话历史压缩的摘要条目在
+    # 基线前，天然不参与判定。压缩若切新文件，isCompactSummary 兜底失效
+    # （新文件行数 < 基线），由 hook 标记主路兜住——诚实降级边界
     baseline = transcript_lines(transcript)
 
     def compact_signal():
-        """压缩已被接受且（或已开始）的信号：PreCompact 标记，或 transcript
-        出现本轮压缩摘要（hook 未注册/旧版 Claude Code 的兜底——那时 pre
-        永不到，但压缩真的执行，isCompactSummary 出现 = 已完成）。"""
-        return read_hook(session_id, "pre", watcher_start) or \
+        """压缩已被接受且（或已开始）的信号：PreCompact 标记（扫描式），或
+        transcript 出现本轮压缩摘要（hook 未注册/旧版 Claude Code 的兜底
+        ——那时 pre 永不到，但压缩真的执行，isCompactSummary 出现 = 已完成）。"""
+        return scan_hook("pre", watcher_start, projects_dir) or \
             scan_transcript(transcript, baseline, compact_summary=True)
 
     compact_started = None
@@ -411,26 +454,31 @@ def run(task: Task) -> None:
     if compact_started is None:
         # 压缩从未被接受（重试耗尽/全局超时）——仍投递唤醒词（晚到无损）
         task.log("no compaction signal after retries, fallback deliver")
-        deliver_wakeup(task, pane, session_id, "no compaction signal fallback")
+        deliver_wakeup(task, pane, projects_dir, "no compaction signal fallback")
         return
 
     # 阶段二：压缩进行中——等 PostCompact 标记（主路）或 transcript
-    # isCompactSummary（兜底）。绝不重注 /compact。
+    # isCompactSummary（兜底）。绝不重注 /compact。pre 标记里的
+    # transcript_path 是压缩时刻的权威路径，据此锁定 transcript。
+    if isinstance(compact_started, dict) and compact_started.get("transcript_path"):
+        tp = Path(compact_started["transcript_path"])
+        if tp.exists():
+            transcript = tp
     task.update(state="COMPACTING")
-    task.log("compaction accepted (PreCompact hook)" if read_hook(session_id, "pre", watcher_start)
+    task.log("compaction accepted (PreCompact hook)" if scan_hook("pre", watcher_start, projects_dir)
              else "compaction detected (transcript isCompactSummary)")
     done = wait_until(
-        lambda: read_hook(session_id, "post", watcher_start)
+        lambda: scan_hook("post", watcher_start, projects_dir)
         or scan_transcript(transcript, baseline, compact_summary=True),
         COMPACT_DONE_TIMEOUT, POLL_INTERVAL,
     )
     if done:
         task.log("compaction done"
-                 + (" (PostCompact hook)" if read_hook(session_id, "post", watcher_start) else " (transcript isCompactSummary)"))
+                 + (" (PostCompact hook)" if scan_hook("post", watcher_start, projects_dir) else " (transcript isCompactSummary)"))
     else:
         task.log(f"no completion signal in {COMPACT_DONE_TIMEOUT}s, fallback deliver")
 
-    deliver_wakeup(task, pane, session_id, "compacted confirmed")
+    deliver_wakeup(task, pane, projects_dir, "compacted confirmed")
 
 
 if __name__ == "__main__":

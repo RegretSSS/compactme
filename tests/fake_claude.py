@@ -26,6 +26,11 @@ fake 的新增保真点是 Claude Code 的**持久层信号**，屏幕渲染保�
   busy_defer 非 compact 提交的 transcript 条目延迟 5s 写（busy 期 Enter
             排队、模型忙完才提交写入——2026-09-17 backend 事故时序）——
             测 watcher 长验证窗轮询命中
+  switch_sid 压缩接受时切 continuation：**新 session id + 新 transcript
+            文件**，hook 标记写新 sid 名（2026-09-18 v0.3.2 生产事故形态：
+            pane 进程 environ 固化旧 sid，按 sid 定位双通道全盲；watcher
+            靠 cwd→mtime 最新文件 + hook 扫描式匹配跟上切换）——测
+            active_transcript 跟随与唤醒词落新文件
 
 保真要点：
 - 输入侧 raw（ICANON/ICRNL 关）——tmux send-keys 的 \r 原样交付，
@@ -141,11 +146,17 @@ def append_transcript(content: str, compact_summary: bool = False):
 def handle_submit(line: str, paste_seq: int | None = None):
     """paste_seq 非 None = 折叠 blob 提交：屏幕渲染折叠形态行，但 transcript
     记完整原文（真实行为——v0.3 判据免疫折叠的根基）。"""
-    global busy, swallowed
+    global busy, swallowed, SESSION_ID, TRANSCRIPT
     LOG.write(f"RECV|{time.strftime('%H:%M:%S')}|{line}\n")
     screen.append(f"❯ [Pasted text #{paste_seq}]" if paste_seq else f"❯ {line}")
     render()
     if line.startswith("/compact") and not (MODE == "swallow" and swallowed == 0):
+        if MODE == "switch_sid" and not TRANSCRIPT.name.endswith("-sw.jsonl"):
+            # 压缩接受即切 continuation：新 session id + 新 transcript 文件，
+            # 后续 hook 标记/条目全落新 sid 名下（v0.3.2 事故实证形态：
+            # pre/post 标记都在切换后的活跃文件名下）
+            SESSION_ID = SESSION_ID + "-sw"
+            TRANSCRIPT = TRANSCRIPT.with_name(f"{SESSION_ID}.jsonl")
         # transcript 先记命令条目（含唤醒词全文——watcher 判据须 /compact 前缀排除）
         append_transcript(line)
         write_hook("PreCompact")

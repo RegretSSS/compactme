@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""deliver_wakeup + transcript/hook 信号源的单元测试（v0.3）。
+"""deliver_wakeup + transcript/hook 信号源的单元测试（v0.3.2）。
 
 v0.3 判据：唤醒词送达 = transcript **新增** user 条目含 head、非 /compact
 前缀、非 isCompactSummary（compact_cmd 内嵌唤醒词全文、压缩摘要复述唤醒词
 都必须排除——2026-09-17 backend 事故 transcript 段实证形态）；压缩生命
 周期 = PreCompact/PostCompact hook 标记，兜底 transcript isCompactSummary。
 屏幕抓取仅剩 dump 留痕。
+
+v0.3.2 锚点：pane cwd → projects 子目录 → mtime 最新 jsonl；hook 标记扫描式
+匹配（ts > watcher_start 且 transcript_path 父目录 == projects 目录）。
+session_id 不参与判定（2026-09-18 第三次试用事故：compact 切换 session id
+新文件、environ 固化旧值，盯 sid 的双通道全盲 → 双发）。
 
 覆盖路径：
   1. happy        注入+Enter → transcript 条目出现 → 一次成功
@@ -17,16 +22,20 @@ v0.3 判据：唤醒词送达 = transcript **新增** user 条目含 head、非 
                   唤醒词）→ 轮前复查不误判，正常投递成功
   5. no_transcript transcript 定位失败 → 无判据，三轮后诚实 FAILED
   6. run 主干     pre/post 标记齐 → COMPACTING → deliver 成功
-  7-10. scan_transcript 直测：head 命中 / compact 前缀排除 / 摘要排除 /
+  7. session 切换回归（v0.3.2 事故形态）：压缩切新 transcript 文件后
+     active_transcript 按 mtime 跟上，deliver 锚对文件
+  8-12. scan_transcript 直测：head 命中 / compact 前缀排除 / 摘要排除 /
         基线增量不漏 / list 型 content
-  11-12. hook 标记直测：陈旧 ts 拒绝（上次压缩遗留不误判）/ 启动清删
-  13. wait_until 语义直测（v0.2.6 mock 失真教训，跨版本保留）
+  13-14. scan_hook 直测：陈旧 ts 拒绝 + 跨会话目录过滤 + 文件名 session id 无关
+  15. wait_until 语义直测（v0.2.6 mock 失真教训，跨版本保留）
 
 确定性策略：time.sleep 置 no-op、wait_until 单次求值——transcript 是真实
-临时文件，路径完全可推演，无真实时间依赖。
+临时文件（目录结构对齐 PROJECTS_ROOT/<projects_dir>/），路径完全可推演，
+无真实时间依赖。
 """
 import importlib.util
 import json
+import os
 import time
 from pathlib import Path
 
@@ -43,6 +52,8 @@ _REAL_WAIT_UNTIL = watcher.wait_until  # fast_time mock 前保存真实实现
 WORD = "[续任务：批B开工] 去哪读：memory/MEMORY.md 与 project_deploy-8ca3617-20260910.md。怎么续：启动批B workflow 四步。"
 HEAD = WORD[:12]
 SID = "test-session-abc123"
+CWD = "/proj"                     # 会话 cwd → projects 子目录 "-proj"
+PROJECTS_DIR = "-proj"
 
 
 def write_entry(path: Path, content, compact_summary: bool = False, type_: str = "user") -> None:
@@ -98,6 +109,9 @@ def fast_time(monkeypatch):
 
 
 def run_deliver(monkeypatch, tmp_path, session):
+    """真实目录结构：tmp_path 充当 PROJECTS_ROOT，transcript 落在
+    <root>/<projects_dir>/<sid>.jsonl——active_transcript 走真实实现。"""
+    monkeypatch.setattr(watcher, "PROJECTS_ROOT", tmp_path)
     cfg = tmp_path / "task.json"
     cfg.write_text(json.dumps({
         "pane": "%9", "session_id": SID, "wakeup_word": WORD, "state": "PENDING",
@@ -107,13 +121,14 @@ def run_deliver(monkeypatch, tmp_path, session):
     monkeypatch.setattr(watcher, "send_key", session.send_key)
     monkeypatch.setattr(watcher, "tmux", session.tmux)
     monkeypatch.setattr(watcher, "capture", lambda pane: "screen")
-    monkeypatch.setattr(watcher, "find_transcript", lambda sid: session.transcript)
-    ok = watcher.deliver_wakeup(task, "%9", SID, "test reason")
+    ok = watcher.deliver_wakeup(task, "%9", PROJECTS_DIR, "test reason")
     return ok, task.cfg
 
 
 def test_happy_path(monkeypatch, tmp_path):
-    session = FakeSession(tmp_path / "proj" / f"{SID}.jsonl")
+    transcript = tmp_path / PROJECTS_DIR / f"{SID}.jsonl"
+    write_entry(transcript, "chat history")    # 真实场景：会话进行中 transcript 必已存在
+    session = FakeSession(transcript)
     ok, cfg = run_deliver(monkeypatch, tmp_path, session)
     assert ok and cfg["state"] == "DONE"
     assert session.text_calls == 1 and session.enter_calls == 1
@@ -124,7 +139,9 @@ def test_delayed_submit_recovered_pre_round(monkeypatch, tmp_path):
     """round1 的 Enter 被 busy 排队：transcript 条目写入晚于轮内验证窗；
     round2 退避后轮前复查命中 → 不重注（防双发）。写入时机挂在
     dump_bottom（round1 失败留痕必经点，时序上恰在验证窗超时后）。"""
-    session = FakeSession(tmp_path / "proj" / f"{SID}.jsonl", behavior="delayed")
+    transcript = tmp_path / PROJECTS_DIR / f"{SID}.jsonl"
+    write_entry(transcript, "chat history")
+    session = FakeSession(transcript, behavior="delayed")
     real_dump = watcher.dump_bottom
 
     def dump_then_flush(task, pane):
@@ -142,7 +159,9 @@ def test_delayed_submit_recovered_pre_round(monkeypatch, tmp_path):
 
 def test_all_fail_reports_failed(monkeypatch, tmp_path):
     """transcript 条目永不出现（文本反复被吞）→ 三轮重注后 FAILED（不假 DONE）。"""
-    session = FakeSession(tmp_path / "proj" / f"{SID}.jsonl", behavior="never")
+    transcript = tmp_path / PROJECTS_DIR / f"{SID}.jsonl"
+    write_entry(transcript, "chat history")
+    session = FakeSession(transcript, behavior="never")
     ok, cfg = run_deliver(monkeypatch, tmp_path, session)
     assert not ok and cfg["state"] == "FAILED"
     assert session.text_calls == 3            # 恰好三轮（退避 0/3/8s），不无限重试
@@ -154,7 +173,7 @@ def test_residual_entries_no_false_sent(monkeypatch, tmp_path):
     """回归（v0.2.2 事故的 transcript 形态）：基线前已有 /compact 命令条目
     （内嵌唤醒词全文）+ isCompactSummary 摘要条目（复述唤醒词）——轮前复查
     不得误判「已送达」，必须走真实投递。"""
-    transcript = tmp_path / "proj" / f"{SID}.jsonl"
+    transcript = tmp_path / PROJECTS_DIR / f"{SID}.jsonl"
     write_entry(transcript, f"/compact 保留任务状态（唤醒词：{WORD}）")
     write_entry(transcript, f"This session is being continued… 摘要含唤醒词：{WORD}",
                 compact_summary=True)
@@ -167,8 +186,7 @@ def test_residual_entries_no_false_sent(monkeypatch, tmp_path):
 
 def test_no_transcript_honest_fail(monkeypatch, tmp_path):
     """transcript 定位失败（异常环境）→ 无送达判据 → 三轮后诚实 FAILED。"""
-    session = FakeSession(tmp_path / "proj" / f"{SID}.jsonl", behavior="accept")
-    session.transcript = None                 # find_transcript 返回 None
+    session = FakeSession(None, behavior="accept")   # projects 目录里没有任何 jsonl
     ok, cfg = run_deliver(monkeypatch, tmp_path, session)
     assert not ok and cfg["state"] == "FAILED"
     log = (tmp_path / "watcher.log").read_text()
@@ -178,15 +196,21 @@ def test_no_transcript_honest_fail(monkeypatch, tmp_path):
 def test_run_happy_with_hooks(monkeypatch, tmp_path):
     """run 主干：/compact 注入 → pre/post 标记（注入后写入——模拟真实
     hook 由 Claude Code 在接受命令/完成压缩时触发，而非预置）→
-    INJECTING 一次成功 → COMPACTING → deliver 成功（不重注 /compact）。"""
+    INJECTING 一次成功 → COMPACTING → deliver 成功（不重注 /compact）。
+
+    标记文件名用**与 task.json 不同的 session id**——v0.3.2 语义：hook 按
+    压缩时刻真实 sid 命名，watcher 扫描式匹配不预知文件名。"""
+    monkeypatch.setattr(watcher, "PROJECTS_ROOT", tmp_path)
     hook_root = tmp_path / "hooks"
     monkeypatch.setattr(watcher, "HOOK_ROOT", hook_root)
-    transcript = tmp_path / "proj" / f"{SID}.jsonl"
+    transcript = tmp_path / PROJECTS_DIR / f"{SID}.jsonl"
     write_entry(transcript, "chat history line")   # 基线前的历史
+
+    real_sid = "real-session-xyz789"               # 压缩时刻的真实 sid ≠ task 记录
 
     def write_marker(event: str) -> None:
         hook_root.mkdir(parents=True, exist_ok=True)
-        (hook_root / f"{SID}.{event}.json").write_text(json.dumps(
+        (hook_root / f"{real_sid}.{event}.json").write_text(json.dumps(
             {"event": event, "ts": time.time() + 3600,   # 未来值确保新于 watcher_start
              "transcript_path": str(transcript)}))
 
@@ -210,7 +234,7 @@ def test_run_happy_with_hooks(monkeypatch, tmp_path):
     monkeypatch.setattr(watcher, "tmux", session.tmux)
     monkeypatch.setattr(watcher, "capture", lambda pane: "screen")
     monkeypatch.setattr(watcher, "pane_alive", lambda pane: True)
-    monkeypatch.setattr(watcher, "find_transcript", lambda sid: transcript)
+    monkeypatch.setattr(watcher, "pane_context", lambda pane: (SID, CWD))
     watcher.run(task)
 
     assert task.cfg["state"] == "DONE"
@@ -219,6 +243,25 @@ def test_run_happy_with_hooks(monkeypatch, tmp_path):
     log = (tmp_path / "watcher.log").read_text()
     assert "compaction accepted (PreCompact hook)" in log
     assert "compaction done (PostCompact hook)" in log
+
+
+def test_deliver_after_transcript_switch(monkeypatch, tmp_path):
+    """v0.3.2 事故核心回归：压缩把写入切到**新 session id 的新 transcript
+    文件**（environ 里的旧 sid 定位失效）。deliver 进门按 mtime 重新定位
+    活跃文件，唤醒词条目在新文件上确认。"""
+    d = tmp_path / PROJECTS_DIR
+    old = d / "392726e5.jsonl"
+    write_entry(old, "旧文件历史（上次压缩前）")
+    new = d / "b1935f68.jsonl"
+    write_entry(new, "continuation 开头（压缩摘要落在这里）")
+    os.utime(old, (1, 1))                     # 旧文件 mtime 拉开，新文件为活跃
+
+    session = FakeSession(new)                # 唤醒词将写入新文件
+    ok, cfg = run_deliver(monkeypatch, tmp_path, session)
+    assert ok and cfg["state"] == "DONE"
+    assert session.text_calls == 1
+    # 送达判据命中的确实是新文件（旧文件不含唤醒词，若锚错必 FAILED/误判）
+    assert HEAD in new.read_text()
 
 
 # ---- scan_transcript 判据直测 ----
@@ -271,25 +314,39 @@ def test_scan_compact_summary_mode(tmp_path):
     assert watcher.scan_transcript(p, 2, compact_summary=True) is not None
 
 
-# ---- hook 标记直测 ----
+# ---- 定位与 hook 扫描直测（v0.3.2）----
 
-def test_read_hook_rejects_stale(tmp_path, monkeypatch):
-    """上次压缩遗留的标记（ts 早于本次 watcher 启动）不得当作本次信号。"""
+def test_active_transcript_survives_session_switch(tmp_path, monkeypatch):
+    """v0.3.2 事故回归：压缩切走 transcript（新 session id 新文件）后，
+    按 session id 定位必失效——active_transcript 按 mtime 跟上切换。"""
+    monkeypatch.setattr(watcher, "PROJECTS_ROOT", tmp_path)
+    d = tmp_path / PROJECTS_DIR
+    old = d / "392726e5.jsonl"
+    new = d / "b1935f68.jsonl"
+    write_entry(old, "old")
+    write_entry(new, "new")
+    os.utime(old, (1, 1))
+    assert watcher.active_transcript(PROJECTS_DIR) == new
+    os.utime(new, (0, 0))                     # 反向：旧文件又变活跃（新一轮切换）
+    assert watcher.active_transcript(PROJECTS_DIR) == old
+
+
+def test_scan_hook_stale_and_dir_filter(tmp_path, monkeypatch):
+    """scan_hook 三重语义：陈旧 ts 拒绝（上次压缩遗留）、transcript_path
+    父目录过滤（跨会话区分）、文件名 session id 与匹配无关（v0.3.2 事故：
+    watcher 无从预知压缩时刻的真实 sid）。"""
     monkeypatch.setattr(watcher, "HOOK_ROOT", tmp_path)
-    marker = tmp_path / f"{SID}.pre.json"
-    marker.write_text(json.dumps({"event": "PreCompact", "ts": 100.0}))
-    assert watcher.read_hook(SID, "pre", watcher_start=200.0) is None    # 陈旧
-    marker.write_text(json.dumps({"event": "PreCompact", "ts": 300.0}))
-    assert watcher.read_hook(SID, "pre", watcher_start=200.0) is not None
-
-
-def test_clear_stale_hooks_removes_markers(tmp_path, monkeypatch):
-    monkeypatch.setattr(watcher, "HOOK_ROOT", tmp_path)
-    for event in ("pre", "post"):
-        (tmp_path / f"{SID}.{event}.json").write_text("{}")
-    watcher.clear_stale_hooks(SID, time.time())
-    assert not (tmp_path / f"{SID}.pre.json").exists()
-    assert not (tmp_path / f"{SID}.post.json").exists()
+    (tmp_path / "aaa.pre.json").write_text(json.dumps(
+        {"event": "PreCompact", "ts": 100.0, "transcript_path": f"/x/{PROJECTS_DIR}/a.jsonl"}))
+    assert watcher.scan_hook("pre", 200.0, PROJECTS_DIR) is None   # 陈旧拒绝
+    (tmp_path / "bbb.pre.json").write_text(json.dumps(
+        {"event": "PreCompact", "ts": 300.0, "transcript_path": f"/x/{PROJECTS_DIR}/b.jsonl"}))
+    hit = watcher.scan_hook("pre", 200.0, PROJECTS_DIR)
+    assert hit and hit["ts"] == 300.0                              # 文件名 sid 未知也命中
+    (tmp_path / "ccc.pre.json").write_text(json.dumps(
+        {"event": "PreCompact", "ts": 400.0, "transcript_path": "/x/-other/c.jsonl"}))
+    hit = watcher.scan_hook("pre", 200.0, PROJECTS_DIR)
+    assert hit and hit["ts"] == 300.0                              # 他 cwd 会话被目录过滤
 
 
 # ---- wait_until 语义直测（v0.2.6 mock 失真教训，跨版本保留）----
