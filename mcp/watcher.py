@@ -305,9 +305,59 @@ def deliver_wakeup(task: Task, pane: str, session_id: str, reason: str) -> bool:
     return False
 
 
+def _child_pids(pid: str) -> list[str]:
+    try:
+        out = subprocess.run(
+            ["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=5
+        ).stdout
+        return out.split()
+    except Exception:
+        return []
+
+
+def session_id_from_pane(pane: str) -> str | None:
+    """从 pane 进程树反查 claude 进程的 CLAUDE_CODE_SESSION_ID。
+
+    消除对 MCP server 版本的依赖：MCP server 是长驻进程、代码在启动时固化
+    （/reload-plugins 不重启 plugin MCP server），而 watcher 每次现读磁盘——
+    2026-09-18 生产事故：老 MCP server 不写 session_id，新 watcher KeyError
+    崩溃、压缩全程未执行。反查让任何版本的 MCP server 都兼容新 watcher。
+    （hook 标记不受此影响：hook 每次事件由 Claude Code 主进程直接 spawn，
+    永远跑磁盘最新代码。）"""
+    root = tmux("display-message", "-p", "-t", pane, "#{pane_pid}").strip()
+    if not root:
+        return None
+    seen: set[str] = set()
+    queue = [root]
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        except OSError:
+            env = []
+        for e in env:
+            if e.startswith(b"CLAUDE_CODE_SESSION_ID="):
+                return e.decode("utf-8", "ignore").split("=", 1)[1]
+        queue.extend(_child_pids(pid))
+    return None
+
+
 def run(task: Task) -> None:
     pane = task.cfg["pane"]
-    session_id = task.cfg["session_id"]
+    # session_id 双来源：task.json（新 MCP server 写入）→ pane 进程树反查
+    # （老 MCP server 兼容，2026-09-18 生产事故的根治）；两者都无则诚实退出
+    session_id = task.cfg.get("session_id") or session_id_from_pane(pane)
+    if not session_id:
+        task.update(state="ABORTED", end_reason="session_id unavailable")
+        task.log("ABORTED: no session_id in task.json and pane process scan "
+                 "found no CLAUDE_CODE_SESSION_ID (not a Claude Code pane?)")
+        return
+    if "session_id" not in task.cfg:
+        task.update(session_id=session_id)
+        task.log(f"session_id recovered from pane process tree: {session_id[:8]}…")
     settle = float(task.cfg.get("settle_seconds", 6))
     global_deadline = float(task.cfg.get("global_timeout", 600))
     retries = int(task.cfg.get("retry_limit", 2))
