@@ -332,17 +332,24 @@ def inject_line(pane: str, text: str) -> None:
     send_key(pane, "Enter")
 
 
-def deliver_wakeup(task: Task, pane: str, projects_dir: str, reason: str) -> bool:
+def deliver_wakeup(task: Task, pane: str, projects_dir: str, reason: str,
+                   transcript_hint: Path | None = None) -> bool:
     """投递唤醒词：注入+Enter 连发 → transcript 出现新增 user 条目含 head。
 
-    transcript 进门重新定位（压缩可能已切换文件——v0.3.2 事故形态）：
-    基线锚在压缩后的活跃文件上，唤醒词条目必在其后。轮前复查上轮延迟
-    提交（busy 期 Enter 排队、忙完才写入 transcript）；三轮退避重注；
-    失败 FAILED 落盘 + dump 留痕。"""
+    transcript 定位：hint（post 标记的 transcript_path——hook 直接携带的
+    压缩时刻权威路径，免 mtime 猜）优先，active_transcript 兜底（无标记的
+    fallback 路径/压缩切文件）。基线锚在压缩后的文件上，唤醒词条目必在
+    其后。轮前复查上轮延迟提交（busy 期 Enter 排队、忙完才写入 transcript）；
+    三轮退避重注；失败 FAILED 落盘 + dump 留痕。"""
     word = task.cfg["wakeup_word"]
     head = wakeup_head(word)
-    transcript = active_transcript(projects_dir)
-    task.log(f"wakeup transcript: {transcript}")
+    transcript = None
+    if transcript_hint is not None and transcript_hint.exists():
+        transcript = transcript_hint
+    if transcript is None:
+        transcript = active_transcript(projects_dir)
+    task.log(f"wakeup transcript: {transcript}"
+             + (" (post hook path)" if transcript is transcript_hint else ""))
     if transcript is None:
         task.log("transcript not found — deliver 确认降级为纯重试（无送达判据）")
 
@@ -478,7 +485,13 @@ def run(task: Task) -> None:
     else:
         task.log(f"no completion signal in {COMPACT_DONE_TIMEOUT}s, fallback deliver")
 
-    deliver_wakeup(task, pane, projects_dir, "compacted confirmed")
+    # post 标记直接携带压缩时刻的权威 transcript_path（hook stdin JSON），
+    # 免 mtime 猜——同 cwd 多会话（目录下他人 jsonl 更活跃）也不会锚错
+    post_mark = scan_hook("post", watcher_start, projects_dir) if done else None
+    hint = None
+    if post_mark and post_mark.get("transcript_path"):
+        hint = Path(post_mark["transcript_path"])
+    deliver_wakeup(task, pane, projects_dir, "compacted confirmed", hint)
 
 
 if __name__ == "__main__":

@@ -264,6 +264,35 @@ def test_deliver_after_transcript_switch(monkeypatch, tmp_path):
     assert HEAD in new.read_text()
 
 
+def test_deliver_prefers_post_hook_path_over_mtime(monkeypatch, tmp_path):
+    """post 标记的 transcript_path 是 hook stdin 直接携带的权威路径——
+    同 cwd 另一会话的 jsonl 更活跃（mtime 最新）也不能把 deliver 带偏
+    （纯 mtime 方案在该场景会锚错文件、判据永假 → 假 FAILED）。"""
+    monkeypatch.setattr(watcher, "PROJECTS_ROOT", tmp_path)
+    d = tmp_path / PROJECTS_DIR
+    mine = d / "mine.jsonl"            # 本会话（post 标记指向这里）
+    other = d / "other.jsonl"          # 同 cwd 另一会话，写入更频繁
+    write_entry(mine, "history")
+    write_entry(other, "other session traffic")
+    os.utime(mine, (1, 1))             # mtime 上 other 更新
+    session = FakeSession(mine)        # 唤醒词将写入 mine
+    cfg = tmp_path / "task.json"
+    cfg.write_text(json.dumps({
+        "pane": "%9", "wakeup_word": WORD, "state": "PENDING",
+    }))
+    task = watcher.Task(cfg)
+    monkeypatch.setattr(watcher, "send_text", session.send_text)
+    monkeypatch.setattr(watcher, "send_key", session.send_key)
+    monkeypatch.setattr(watcher, "tmux", session.tmux)
+    monkeypatch.setattr(watcher, "capture", lambda pane: "screen")
+    ok = watcher.deliver_wakeup(task, "%9", PROJECTS_DIR, "test reason",
+                                 transcript_hint=mine)
+    assert ok and task.cfg["state"] == "DONE"
+    assert HEAD in mine.read_text()
+    log = (tmp_path / "watcher.log").read_text()
+    assert "(post hook path)" in log
+
+
 # ---- scan_transcript 判据直测 ----
 
 def test_scan_hits_head_in_new_user_entry(tmp_path):

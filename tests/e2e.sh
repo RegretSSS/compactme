@@ -30,8 +30,11 @@ tmux new-session -d -s "$S" -x 120 -y 40 \
 sleep 1
 PANE=$(tmux display-message -p -t "$S" '#{pane_id}')
 
-# 贴近真实的长文本（compact_cmd 内嵌唤醒词全文，总长数百字）
-WAKEUP="[续任务：e2e 验证] 去哪读：/tmp/compactme-e2e/received.log 与 task.json 终态。读什么：本模式注入-投递全链路痕迹。怎么续：核对 received.log 中唤醒词行数恰为 1（不重复发送）。"
+# 贴近真实的长文本（compact_cmd 内嵌唤醒词全文，总长数百字）。唤醒词嵌
+# 本轮 SID——多轮 e2e 共享 hooks/projects 目录，head 固定会跨轮串认
+# （2026-09-18 抓出：上一轮 watcher 扫到下一轮标记 + 同文本 head 误命中
+# 假 DONE），唯一化后跨轮 head 互不匹配
+WAKEUP="[续任务：e2e 验证-$SID] 去哪读：/tmp/compactme-e2e/received.log 与 task.json 终态。读什么：本模式注入-投递全链路痕迹。怎么续：核对 received.log 中唤醒词行数恰为 1（不重复发送）。"
 CMD="/compact e2e 测试压缩：保留任务状态、已完成步骤、关键决策与文件路径（长文本贴近生产形态，内嵌唤醒词全文防止截断误判）。$WAKEUP"
 
 # swallow 模式：缩短 PreCompact 等待（默认 90s 为覆盖 busy 排队，e2e 无 busy）
@@ -66,11 +69,11 @@ SW=""; [ "$MODE" = "switch_sid" ] && SW="-sw"
 ASSERT_T="${TRANSCRIPT%.jsonl}$SW.jsonl"
 HOOK_SID="$SID$SW"
 # 唤醒词计数须排除 compact_cmd 内嵌的唤醒词全文（compact 提交行同串命中）
-N_WAKE=$(grep "续任务：e2e 验证" /tmp/compactme-e2e/received.log | grep -vc "|/compact" || true)
+N_WAKE=$(grep "续任务：e2e 验证-$SID" /tmp/compactme-e2e/received.log | grep -vc "|/compact" || true)
 N_COMPACT=$(grep -c "^RECV|.*|/compact" /tmp/compactme-e2e/received.log || true)
 # transcript 层断言（与 watcher 判据同语义：user 条目以唤醒词开头、非摘要、
 # 非 /compact 前缀——compact_cmd 内嵌全文与摘要复述都不算送达）
-T_WAKE=$(python3 - "$ASSERT_T" <<'PYEOF'
+T_WAKE=$(python3 - "$ASSERT_T" "[续任务：e2e 验证-$SID]" <<'PYEOF'
 import json, sys
 n = 0
 try:
@@ -85,7 +88,7 @@ for ln in lines:
     if isinstance(c, list):
         c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
     s = (c or "").strip()
-    if s.startswith("[续任务：e2e 验证]"): n += 1   # 完整原文（折叠 blob 提交也记原文）
+    if s.startswith(sys.argv[2]): n += 1   # 完整原文（折叠 blob 提交也记原文）
 print(n)
 PYEOF
 )
@@ -116,12 +119,16 @@ case "$MODE" in
     # v0.3.2 事故形态回归：压缩切 sid/文件后不得误判重发（事故现场：双发
     # /compact + 唤醒词空转）；唤醒词必须落 continuation 新文件
     [ "$N_COMPACT" -eq 1 ] || { echo "❌ compact $N_COMPACT 次（sid 切换后误判重发）"; FAIL=1; }
-    OLD_HITS=$(grep -c "续任务" "$TRANSCRIPT" 2>/dev/null || true)
+    OLD_HITS=$(grep -c "续任务：e2e 验证-$SID" "$TRANSCRIPT" 2>/dev/null || true)
     OLD_HITS=${OLD_HITS:-0}   # ugrep 对不存在文件输出空（GNU 输出 0），兜底
     [ "$OLD_HITS" -eq 0 ] || { echo "❌ 唤醒词痕迹出现在旧 transcript（应只落新文件）"; FAIL=1; } ;;
   *)
     [ "$N_COMPACT" -eq 1 ] || { echo "❌ compact $N_COMPACT 次（应 1，防双发）"; FAIL=1; } ;;
 esac
 [ "$FAIL" = 0 ] && echo "✅ e2e[$MODE] PASS"
+# 收尾必杀 watcher：卡住轮的 watcher 长寿存活（COMPACTING 240s + deliver），
+# 会扫到后续轮的 hook 标记跨轮串场（2026-09-18 normal 轮假 DONE 事故链）
+WPID=$(python3 -c "import json;print(json.load(open('$RUN/task.json')).get('watcher_pid',''))" 2>/dev/null)
+[ -n "$WPID" ] && kill "$WPID" 2>/dev/null
 tmux kill-session -t "$S" 2>/dev/null
 exit $FAIL
