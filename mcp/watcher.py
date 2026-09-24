@@ -50,6 +50,7 @@ transcript 优势（2026-09-17 事故 transcript 铁证）：写入先于 TUI �
 """
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -229,9 +230,12 @@ def pane_context(pane: str) -> tuple[str | None, str | None]:
 
 
 def projects_dir_name(cwd: str) -> str:
-    """会话 cwd → projects 子目录名（Claude Code 规则：/ 换 -）。
-    /home/remedy/x → -home-remedy-x"""
-    return cwd.replace("/", "-")
+    """会话 cwd → projects 子目录名（Claude Code 规则：非 [a-zA-Z0-9-]
+    字符每个替换成一个 -，含 /、_、.、中文——2026-09-25 jzx 事故实证：
+    cwd=/mnt/d/000-自制软件/建筑信源 的目录名是 -mnt-d-000----------，
+    只替换 / 会算出带中文的名字 → active_transcript/scan_hook 双盲）。
+    /home/remedy/x → -home-remedy-x；/tmp/试_验.目录 → -tmp-------"""
+    return re.sub(r"[^a-zA-Z0-9-]", "-", cwd)
 
 
 def active_transcript(projects_dir: str) -> Path | None:
@@ -349,7 +353,8 @@ def deliver_wakeup(task: Task, pane: str, projects_dir: str, reason: str,
     if transcript is None:
         transcript = active_transcript(projects_dir)
     task.log(f"wakeup transcript: {transcript}"
-             + (" (post hook path)" if transcript is transcript_hint else ""))
+             + (" (post hook path)" if transcript_hint is not None
+                and transcript is transcript_hint else ""))
     if transcript is None:
         task.log("transcript not found — deliver 确认降级为纯重试（无送达判据）")
 

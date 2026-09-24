@@ -191,6 +191,9 @@ def test_no_transcript_honest_fail(monkeypatch, tmp_path):
     assert not ok and cfg["state"] == "FAILED"
     log = (tmp_path / "watcher.log").read_text()
     assert "transcript not found" in log
+    # hint 与 transcript 双 None 时不得误标 "(post hook path)"（v0.3.3
+    # log bug：jzx 事故 fallback deliver 打出 None (post hook path)）
+    assert "(post hook path)" not in log
 
 
 def test_run_happy_with_hooks(monkeypatch, tmp_path):
@@ -344,6 +347,19 @@ def test_scan_compact_summary_mode(tmp_path):
 
 
 # ---- 定位与 hook 扫描直测（v0.3.2）----
+
+def test_projects_dir_name_escapes_non_ascii():
+    """v0.3.3 事故回归（2026-09-25 jzx pane %6）：Claude Code 把 cwd 里
+    非 [a-zA-Z0-9-] 字符**每个**替换成一个 -（含 /、_、.、中文）——只替换 /
+    会算出带中文的目录名 → active_transcript/scan_hook 双盲 → 3 次重注。
+    样本一为事故现场，样本二为 headless claude 实测。"""
+    assert watcher.projects_dir_name("/mnt/d/000-自制软件/建筑信源") \
+        == "-mnt-d-000----------"
+    assert watcher.projects_dir_name("/tmp/试_验.目录") == "-tmp-------"
+    # ASCII 回归：原 - 保留，不受影响
+    assert watcher.projects_dir_name("/home/remedy/workspace/eng-assistant-ops") \
+        == "-home-remedy-workspace-eng-assistant-ops"
+
 
 def test_active_transcript_survives_session_switch(tmp_path, monkeypatch):
     """v0.3.2 事故回归：压缩切走 transcript（新 session id 新文件）后，
