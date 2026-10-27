@@ -3,6 +3,8 @@
   "version": "0.3.3",
   "description": "Model-initiated self-compact: injects /compact + a wakeup word carrying task-reconstruction clues back into the same session",
   "author": {
-    "name": "remedy"
-  }
+    "name": "RegretSSS"
+  },
+  "homepage": "https://github.com/RegretSSS/compactme",
+  "repository": "https://github.com/RegretSSS/compactme"
 }

@@ -13,12 +13,14 @@ description: 当上下文接近耗尽、或检测到复读/注意力漂移时，
 
 1. 等待 settle（模型写完收尾总结、TUI 回到输入态）→ 分键注入 `/compact <描述>`
    （文本先进框，Enter 独立后发，防时序竞争）
-2. 前瞻轮询本 pane 屏幕帧（`capture-pane` 只读快照，无换页无冲突），看到
-   `⎿ Compacted (ctrl+o` 特征串后**才**注入 `<唤醒词>`——post-compact 动态注入
+2. 通过 **PreCompact / PostCompact hook 标记**（插件自注册，写
+   `/tmp/compactme/hooks/`）确认压缩开始/完成；hook 未生效时降级为
+   **session transcript** 的 `isCompactSummary` 判据（v0.3 信号源，不再看屏幕
+   ——v0.2.x 四次生产事故全是屏幕形态问题）。压缩确认完成后**才**注入
+   `<唤醒词>`——post-compact 动态注入
 
-若 `/compact` 被当成普通消息（屏幕出现 `esc to interrupt` 而非 Compacting），
-watcher 等模型停下后自动重试（≤2 次）；全局超时则兜底注入唤醒词（含重建线索，
-晚到无损）。
+若 `/compact` 被当成普通消息吞掉（PreCompact 不触发），watcher 超时后自动
+重试（≤2 次）；全局超时则兜底注入唤醒词（含重建线索，晚到无损）。
 
 **只发第一条 = 自杀**：压缩后的新上下文停在待机态，无法自我恢复任务。
 第二条唤醒词是活的唯一保证。

@@ -1,9 +1,9 @@
 {
-  "name": "local",
-  "version": "0.2.1",
-  "description": "Local plugin marketplace: plugins developed in-house, sourced directly from git working tree",
+  "name": "compactme",
+  "version": "0.3.3",
+  "description": "compactme plugin marketplace — install with /plugin marketplace add RegretSSS/compactme",
   "owner": {
-    "name": "remedy"
+    "name": "RegretSSS"
   },
   "plugins": [
     {
