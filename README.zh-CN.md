@@ -83,10 +83,38 @@ tmux pane ($TMUX_PANE)
 - **ssh 远程没问题**,只要 tmux 和 claude 在同一台(远程)机器上。会话 pane
   避免嵌套 tmux-in-tmux。
 - **context_stats 加分项:** 状态栏若显示 `🧠 125.7k/1M 12.6%`,工具优先解析
-  (天然按对话隔离);否则回退 transcript 的 usage 字段。
+  (天然按对话隔离);否则回退 transcript 的 usage 字段。配置方法见
+  [状态栏水位设置](#可选状态栏上下文水位推荐)小节,一分钟搞定。
 
 运行时产物在 `/tmp/compactme/<pane>/`(`task.json`、`watcher.log`),随时可删,
 不碰系统其他任何东西。
+
+## 可选:状态栏上下文水位(推荐)
+
+`context_stats()` 识别上下文水位**优先走 pane 状态栏**(`🧠 已用/窗口 百分比`
+——实时、天然按对话隔离);没配状态栏则回退 transcript 的 usage 字段(可用,
+但多会话并行时可能拿错文件)。Claude Code 默认状态栏不显示水位,因此仓库自带
+一个零依赖的最小 statusline 脚本:
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 /compactme绝对路径/statusline/context_statusline.py"
+  }
+}
+```
+
+重载 Claude Code 后状态栏即显示如 `🧠 121.4k/1.0M 12.1%`。窗口默认 200k,
+1M 窗口模型加环境变量:
+
+```jsonc
+"command": "COMPACTME_CONTEXT_WINDOW=1000000 python3 /.../context_statusline.py"
+```
+
+(脚本读会话 transcript 最新一条 assistant `usage`——input + cache 创建 +
+cache 读取,与 Claude Code 自身的 token 记账口径一致。)
 
 ## 工作原理
 

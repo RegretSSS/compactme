@@ -97,10 +97,41 @@ tmux pane ($TMUX_PANE)
   Avoid nested tmux-in-tmux for the session pane.
 - **`context_stats` bonus:** if your statusline shows `🧠 125.7k/1M 12.6%`, the
   tool parses it (naturally per-conversation); otherwise it falls back to the
-  transcript's usage field.
+  transcript's usage field. See [the statusline section](#optional-context-statusline-recommended)
+  to set one up in one minute.
 
 Runtime artifacts live in `/tmp/compactme/<pane>/` (`task.json`,
 `watcher.log`) — safe to delete anytime; nothing else touches your system.
+
+## Optional: context statusline (recommended)
+
+`context_stats()` recognizes context water level **from your pane's
+statusline** first (`🧠 used/window pct%` — live, and naturally isolated per
+conversation); without one it falls back to the transcript's usage field
+(works, but may mis-pick the file when multiple sessions run in parallel).
+Claude Code doesn't show a context gauge by default, so this ships a
+minimal, dependency-free statusline script:
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 /abs/path/to/compactme/statusline/context_statusline.py"
+  }
+}
+```
+
+Reload Claude Code and the statusline shows e.g. `🧠 121.4k/1.0M 12.1%`.
+The context window defaults to 200k; for a 1M-window model:
+
+```jsonc
+"command": "COMPACTME_CONTEXT_WINDOW=1000000 python3 /abs/.../context_statusline.py"
+```
+
+(The script reads the session transcript's latest assistant `usage` —
+input + cache-creation + cache-read tokens — the same accounting Claude
+Code itself uses.)
 
 ## How it works
 
