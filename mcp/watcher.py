@@ -22,6 +22,18 @@ pane 进程 environ 的 CLAUDE_CODE_SESSION_ID 固化在启动值永不更新—
               本 pane 的 projects 目录（不预知 session id）
   session_id 降级为信息性记录，不参与任何判定。
 
+v0.3.4（2026-10-30 两连挂事故）：Claude Code 升级 2.1.312（原生二进制
+TUI）后 /compact 注入连续被吞——attempt 1/2 都以普通消息进对话，
+PreCompact 不触发。根因：新版 TUI 对单块到达的超长输入（阈值实测在
+426~860 字符之间）折叠为 paste blob，blob 提交不再解析 slash 命令；
+旧版折叠仍执行的兼容行为没了。而 compactme MCP 把唤醒词全文拼进
+compact_cmd（860~1100+ 字符）必超阈值。修复（用户裁决：命令过长本身
+是劣化——压缩准备在注入前就该落盘做完）：
+  compact_cmd 瘦身（MCP 层，不再拼唤醒词全文）+ 注入前长度防御
+  （safe_compact_cmd，超长降级纯 /compact，SAFE_CMD_MAX=200 留 2 倍
+  裕量）。唤醒词投递不改：blob 提交后 transcript 记完整原文，head
+  匹配判据实测仍有效。详见 INJECT_FIX_REPORT_2026-10-30.md。
+
 transcript 优势（2026-09-17 事故 transcript 铁证）：写入先于 TUI 渲染 10s+；
 折叠 paste 提交后记录完整原文（屏幕只显 [Pasted text #N]）——屏幕雷区全免疫。
 
@@ -71,6 +83,7 @@ DELIVER_BACKOFF = (0.0, 3.0, 8.0)  # 各轮注入前退避
 DELIVER_ROUNDS = len(DELIVER_BACKOFF)
 CLEAR_BS = 1200            # 清框 BSpace 数：唤醒词实测 1036 字符，宁多勿少
 KEY_TEXT_SETTLE = 0.3      # 注入文本与 Enter 之间的间隔（防乱序）
+SAFE_CMD_MAX = 200         # /compact 命令安全长度上限（v0.3.4，详见 safe_compact_cmd）
 
 
 def tmux(*args: str) -> str:
@@ -324,6 +337,25 @@ def dump_bottom(task: Task, pane: str) -> None:
         task.log(f"  | {line[:120]}")
 
 
+def safe_compact_cmd(cmd: str) -> str:
+    """v0.3.4（2026-10-30 两连挂事故）：注入命令的长度防御。
+
+    Claude Code 2.1.312 起（原生二进制 TUI），单块到达的输入超过阈值
+    （实测 426 字符过、860 字符折叠，阈值在两者之间）被整体折叠为
+    paste blob，**blob 提交不再解析 slash 命令**——`/compact 长指令`
+    被当普通消息发给模型（transcript 有 user 原文条目但无 command-name
+    条目、PreCompact 不触发），旧版「折叠也照样执行命令」的行为没了。
+    上游（compactme MCP 拼接的 compact_cmd）一旦膨胀，注入必挂。
+
+    防御：超长（>SAFE_CMD_MAX，留 2 倍裕量）或前缀异常 → 降级为纯
+    /compact。压缩准备本就该在注入前落盘完成，长指令是劣化形态——
+    降级只丢摘要侧重指引，不丢压缩本身。唤醒词投递不受影响（blob
+    提交后 transcript 记完整原文，head 匹配判据实测仍有效）。"""
+    if cmd.startswith(MARK_COMPACT_CMD) and len(cmd) <= SAFE_CMD_MAX:
+        return cmd
+    return MARK_COMPACT_CMD
+
+
 def inject_line(pane: str, text: str) -> None:
     """注入一行文本并提交：清框 → 文本 → 短歇 → Enter。
 
@@ -441,6 +473,13 @@ def run(task: Task) -> None:
             scan_transcript(transcript, baseline, compact_summary=True)
 
     compact_started = None
+    # v0.3.4 长度防御：超长/异常命令降级纯 /compact（2.1.312 折叠吞命令，
+    # 见 safe_compact_cmd）——上游膨胀也保注入可执行
+    cmd = safe_compact_cmd(task.cfg["compact_cmd"])
+    if cmd != task.cfg["compact_cmd"]:
+        task.log(f"compact_cmd degraded to pure /compact "
+                 f"(len={len(task.cfg['compact_cmd'])} > {SAFE_CMD_MAX} — "
+                 f"2.1.312 paste-blob swallow defense)")
     for attempt in range(1, retries + 2):
         if not pane_alive(pane):
             task.update(state="ABORTED", end_reason="pane gone")
@@ -449,7 +488,7 @@ def run(task: Task) -> None:
             break
 
         task.update(state="INJECTING", attempt=attempt)
-        inject_line(pane, task.cfg["compact_cmd"])
+        inject_line(pane, cmd)
         task.log(f"compact injected (attempt {attempt}), waiting PreCompact/transcript signal")
 
         # 阶段一：PreCompact 标记 = Claude Code 确切接受了 /compact 命令。

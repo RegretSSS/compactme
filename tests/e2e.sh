@@ -33,7 +33,10 @@ PANE=$(tmux display-message -p -t "$S" '#{pane_id}')
 # 贴近真实的长文本（compact_cmd 内嵌唤醒词全文，总长数百字）。唤醒词嵌
 # 本轮 SID——多轮 e2e 共享 hooks/projects 目录，head 固定会跨轮串认
 # （2026-09-18 抓出：上一轮 watcher 扫到下一轮标记 + 同文本 head 误命中
-# 假 DONE），唯一化后跨轮 head 互不匹配
+# 假 DONE），唯一化后跨轮 head 互不匹配。
+# v0.3.4 起超长 compact_cmd 会被 watcher 防御降级为纯 /compact 注入
+# （2.1.312 折叠吞命令事故）——本用例顺带覆盖降级路径：断言全部以
+# /compact 前缀口径匹配，降级后依然成立
 WAKEUP="[续任务：e2e 验证-$SID] 去哪读：/tmp/compactme-e2e/received.log 与 task.json 终态。读什么：本模式注入-投递全链路痕迹。怎么续：核对 received.log 中唤醒词行数恰为 1（不重复发送）。"
 CMD="/compact e2e 测试压缩：保留任务状态、已完成步骤、关键决策与文件路径（长文本贴近生产形态，内嵌唤醒词全文防止截断误判）。$WAKEUP"
 

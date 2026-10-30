@@ -35,6 +35,11 @@ CLUE_MARKERS = (
 HARD_THRESHOLD = 400_000  # ≥ 此值：无条件建议压缩
 SOFT_THRESHOLD = 200_000  # ≥ 此值且处于天然断点：建议在断点处压缩
 
+# /compact 注入命令长度上限（v0.3.4，与 watcher.py SAFE_CMD_MAX 同值互指）：
+# Claude Code 2.1.312 起超长单块输入被 TUI 折叠成 paste blob，blob 提交不再
+# 解析 slash 命令（实测 426 字符过、860 折叠），200 留 2 倍裕量。
+SAFE_CMD_MAX = 200
+
 
 def _verdict(tokens: int) -> tuple[str, str]:
     """三档判定，规则详见 SKILL.md「触发水位」。
@@ -164,8 +169,11 @@ def compactme(compact_instructions: str, wakeup_word: str, settle_seconds: float
     必须作为本轮最后一个工具调用，之后立即写收尾总结并结束回合。
 
     Args:
-        compact_instructions: /compact 的描述——写明压缩摘要要保留什么
-            （当前任务状态、已完成步骤、关键决策、相关文件路径）。
+        compact_instructions: /compact 的描述——压缩摘要的侧重，一句话即可
+            （如「保留任务状态、已完成步骤与下一步」）。任务重建线索落盘
+            是调用前的准备动作，不写进命令；唤醒词也不进命令（压缩后由
+            watcher 独立投递）。命令超长会被截断（新版 TUI 超长输入被折
+            叠成 paste blob 后 /compact 不再执行，v0.3.4 事故）。
         wakeup_word: 压缩完成后送达的唤醒词，必须包含任务重建线索三要素：
             去哪读（文件路径 / TaskList）、读什么、怎么续（下一步第一个动作）。
             缺少线索会被拒绝执行。
@@ -184,9 +192,14 @@ def compactme(compact_instructions: str, wakeup_word: str, settle_seconds: float
         )
 
     compact_instructions = compact_instructions.strip() or "保留当前任务状态、已完成步骤与下一步动作。"
-    compact_cmd = (
-        f"/compact {compact_instructions}（压缩完成后将收到唤醒词：{wakeup_word}）"
-    )
+    # v0.3.4 命令瘦身（2026-10-30 两连挂事故，详见 watcher.py v0.3.4 段）：
+    # 唤醒词全文不再拼进 /compact——它由 watcher 在压缩完成后独立投递，
+    # 塞进命令只是膨胀长度；超长命令会被 2.1.312 TUI 折叠成 paste blob
+    # 后当普通消息吞掉（slash 命令不再解析）。压缩准备（任务状态/线索
+    # 落盘）本就该在调用 compactme 前完成，命令只带一句摘要侧重即可。
+    compact_cmd = f"/compact {compact_instructions}".rstrip()
+    if len(compact_cmd) > SAFE_CMD_MAX:
+        compact_cmd = compact_cmd[: SAFE_CMD_MAX - 1].rstrip() + "…"
 
     # per-pane 任务目录：多实体天然隔离
     safe_pane = PANE.lstrip("%") or "unknown"
