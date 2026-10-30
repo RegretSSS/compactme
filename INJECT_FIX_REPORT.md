@@ -112,6 +112,13 @@ compact_cmd = f"/compact {compact_instructions}（压缩完成后将收到唤醒
    注入通道在新版 2.1.312 标准交互形态上从注入到压缩确认**全链路恢复**。
    （另一次 09:33:03 的注入同样 1s 触发 PreCompact，压缩进行中被 09:36 整机
    重启打断——与注入通道无关。）
+4. **SAFE_CMD_MAX=400 边界活体实测（本调查的 ops 会话自身，10:05）**：构造恰
+   400 字 compact_cmd（真实摘要 + 句点填充）注入 pane %7 → 4s 内 PreCompact
+   hook 接受 → 压缩完成（PostCompact 10:07:12）→ 唤醒词第 1 轮注入即确认
+   送达（`compacted confirmed`，无重发）。**400 字命令在 2.1.312 交互会话走
+   typed 路径直通**，400 上限定稿（commit 00e0d53）。此例同时为 §五.1 疑点
+   提供对照：交互会话 PreCompact 后压缩正常完成，未复现 job 形态的「接受后
+   未跑」。
 
 ## 五、遗留观察（非本次 patch 范围，记录备查）
 
