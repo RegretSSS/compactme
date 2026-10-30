@@ -37,8 +37,10 @@ SOFT_THRESHOLD = 200_000  # ≥ 此值且处于天然断点：建议在断点处
 
 # /compact 注入命令长度上限（v0.3.4，与 watcher.py SAFE_CMD_MAX 同值互指）：
 # Claude Code 2.1.312 起超长单块输入被 TUI 折叠成 paste blob，blob 提交不再
-# 解析 slash 命令（实测 426 字符过、860 折叠），200 留 2 倍裕量。
-SAFE_CMD_MAX = 200
+# 解析 slash 命令（实测 426 字符过、860 折叠）。契约层面要求 instructions
+# 300 字以内（压缩命令无需附带大量信息，见工具 docstring）；实现放宽到
+# 400——低于实测通过点 426，数学上必走 typed 路径（用户 2026-10-30 裁决）。
+SAFE_CMD_MAX = 400
 
 
 def _verdict(tokens: int) -> tuple[str, str]:
@@ -170,10 +172,11 @@ def compactme(compact_instructions: str, wakeup_word: str, settle_seconds: float
 
     Args:
         compact_instructions: /compact 的描述——压缩摘要的侧重，一句话即可
-            （如「保留任务状态、已完成步骤与下一步」）。任务重建线索落盘
-            是调用前的准备动作，不写进命令；唤醒词也不进命令（压缩后由
-            watcher 独立投递）。命令超长会被截断（新版 TUI 超长输入被折
-            叠成 paste blob 后 /compact 不再执行，v0.3.4 事故）。
+            （如「保留任务状态、已完成步骤与下一步」），**无需附带大量信息，
+            控制在 300 字以内**。任务重建线索落盘是调用前的准备动作，不写
+            进命令；唤醒词也不进命令（压缩后由 watcher 独立投递）。命令超
+            长会被截断（新版 TUI 超长输入被折叠成 paste blob 后 /compact
+            不再执行，v0.3.4 事故）。
         wakeup_word: 压缩完成后送达的唤醒词，必须包含任务重建线索三要素：
             去哪读（文件路径 / TaskList）、读什么、怎么续（下一步第一个动作）。
             缺少线索会被拒绝执行。

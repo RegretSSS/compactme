@@ -76,7 +76,7 @@ compact_cmd = f"/compact {compact_instructions}（压缩完成后将收到唤醒
 ### 3.1 源头瘦身：`mcp/compactme_mcp.py`
 
 - compact_cmd 不再拼唤醒词全文（唤醒词由 watcher 压缩完成后独立投递，本就不该进命令）。
-- 新增 `SAFE_CMD_MAX = 200`（实测挂点 860 的一半以下、426 通过值的一半，双裕量），
+- 新增 `SAFE_CMD_MAX = 400`（契约 300 字以内、实现 400，低于实测通过点 426；用户 2026-10-30 裁决），
   `/compact {instructions}` 超长截断加 `…`。
 - 工具 docstring 同步新契约：instructions 一句话侧重；重建线索落盘是调用前准备，
   不写进命令。
