@@ -456,6 +456,20 @@ def run(task: Task) -> None:
     task.log(f"watcher start pid={os.getpid()} pane={pane} cwd={cwd} "
              f"projects_dir={projects_dir} session={session_id[:8] if session_id else '?'}…")
 
+    # 信号黑匣子（2026-11-07 三连丢唤醒词事故：watcher 死于 OOM 名单之外的未知信号，
+    # 无日志无尸体（父 MCP server 不 wait → zombie），死因不可追溯。装黑匣子：
+    # 可捕获信号到来时先把信号名与时刻写进 watcher.log 再退出，下次复发即可定位凶手。
+    # SIGKILL 不可捕获——若再出现「无黑匣子行却死亡」即缩小为 SIGKILL/硬崩两类。
+    def _blackbox(signum, _frame):
+        try:
+            task.log(f"*** BLACKBOX: watcher dying by signal {signum} "
+                     f"({signal.Signals(signum).name}) at {time.strftime('%H:%M:%S')} "
+                     f"after {time.time() - watcher_start:.0f}s, state={task.cfg.get('state')}")
+        finally:
+            os._exit(128 + signum)
+    for _sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
+        signal.signal(_sig, _blackbox)
+
     t0 = time.time()
     time.sleep(settle)  # 等模型收尾总结、TUI 回到输入态
 

@@ -17,6 +17,10 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+# 活跃 watcher 的 Popen 句柄表（task_dir → Popen），供跨调用收尸。
+# 2026-11-07 三连丢事故引入：watcher 被外部信号杀死后无人 wait → zombie 挂死。
+_WATCHERS: dict = {}
+
 mcp = FastMCP("compactme")
 
 PANE = os.environ.get("TMUX_PANE")
@@ -222,12 +226,27 @@ def compactme(compact_instructions: str, wakeup_word: str, settle_seconds: float
     task_file.write_text(json.dumps(task, ensure_ascii=False, indent=2))
 
     # fork watcher：nohup 脱离本进程生命周期（MCP server 会随 compact 断连重启）
-    subprocess.Popen(
+    spawned = subprocess.Popen(
         ["nohup", sys.executable, str(HERE / "watcher.py"), str(task_file)],
         stdout=subprocess.DEVNULL,
         stderr=open(task_dir / "watcher.log", "a"),
         start_new_session=True,
     )
+    # 收尸登记（2026-11-07 三连丢事故：watcher 被外部信号杀死后 MCP server 从不 wait，
+    # 尸体挂 zombie 且无死亡日志）。存 Popen 句柄，后续每次 compactme() 调用时 poll()
+    # 非阻塞收尸；退出码也留档 watcher.log（黑匣子的 server 侧补充）。
+    global _WATCHERS
+    _WATCHERS[str(task_dir)] = spawned
+    for key, popen in list(_WATCHERS.items()):
+        rc = popen.poll()
+        if rc is not None:
+            try:
+                with open(Path(key) / "watcher.log", "a") as wl:
+                    wl.write(f"[reap] watcher pid={popen.pid} exit={rc} at "
+                             f"{__import__('time').strftime('%H:%M:%S')}\n")
+            except OSError:
+                pass
+            del _WATCHERS[key]
 
     return (
         f"已派发 watcher（任务目录 {task_dir}，session {SESSION_ID[:8]}…）。\n"
