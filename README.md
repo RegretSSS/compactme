@@ -133,6 +133,24 @@ The context window defaults to 200k; for a 1M-window model:
 input + cache-creation + cache-read tokens — the same accounting Claude
 Code itself uses.)
 
+## Built-in: periodic gauge injection (autonomous sessions)
+
+`hooks/gauge_hook.py` registers a `PostToolUse` hook that injects the
+context water level **and current time** into the model's context — but
+only once every **N tool calls (default 25) or T seconds (default 900)**,
+plus immediately on crossing the SOFT/HARD thresholds. All other calls
+stay silent (~20 ms each). Built for long autonomous runs where the user
+rarely prompts, so `UserPromptSubmit`-based injection would never fire.
+
+Per-session isolation is structural: each session's hook process receives
+its **own** `session_id` / `transcript_path` on stdin; state lives in
+`~/.cache/cc-gauge/<session_id>.json`; the water level is computed from
+that session's transcript only. The context window auto-detects from the
+transcript's `requestedModel` field (`[1m]` marker → 1M window, thresholds
+300k/500k; otherwise 200k window, thresholds 150k/180k). Override via env:
+`CC_GAUGE_N`, `CC_GAUGE_T`, `CC_GAUGE_WINDOW`, `CC_GAUGE_SOFT`,
+`CC_GAUGE_HARD`.
+
 ## How it works
 
 ```
