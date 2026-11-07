@@ -68,6 +68,7 @@ import signal
 import subprocess
 import sys
 import time
+from itertools import islice
 from pathlib import Path
 
 HOOK_ROOT = Path(os.environ.get("COMPACTME_HOOK_ROOT", "/tmp/compactme/hooks"))
@@ -298,30 +299,33 @@ def scan_transcript(path: Path | None, baseline: int, *,
     if path is None or not path.exists():
         return None
     try:
-        lines = path.read_text().splitlines()
+        # 流式逐行（2026-11-07 五连 OOM 终极根因：read_text().splitlines() 全量载入
+        # GB 级 transcript → watcher 自身 RSS 6.8-8.9GB → global OOM 杀 watcher 自己
+        # → 唤醒词五连丢。islice 跳过基线前行,逐行处理不囤积,峰值=单行缓冲）。
+        with path.open() as f:
+            for ln in islice(f, baseline, None):
+                try:
+                    d = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                if compact_summary:
+                    if d.get("isCompactSummary"):
+                        return d.get("message", {}).get("content") or "compact summary"
+                    continue
+                if d.get("type") != "user" or d.get("isCompactSummary"):
+                    continue
+                c = (d.get("message") or {}).get("content")
+                if isinstance(c, list):
+                    c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
+                if not isinstance(c, str):
+                    continue
+                s = c.strip()
+                if not s or s.startswith(MARK_COMPACT_CMD):
+                    continue
+                if head and head in s:
+                    return s
     except OSError:
         return None
-    for ln in lines[baseline:]:
-        try:
-            d = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
-        if compact_summary:
-            if d.get("isCompactSummary"):
-                return d.get("message", {}).get("content") or "compact summary"
-            continue
-        if d.get("type") != "user" or d.get("isCompactSummary"):
-            continue
-        c = (d.get("message") or {}).get("content")
-        if isinstance(c, list):
-            c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
-        if not isinstance(c, str):
-            continue
-        s = c.strip()
-        if not s or s.startswith(MARK_COMPACT_CMD):
-            continue
-        if head and head in s:
-            return s
     return None
 
 
