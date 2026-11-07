@@ -1,7 +1,7 @@
 {
   "name": "compactme",
-  "version": "0.3.4",
-  "description": "Model-initiated self-compact: injects /compact + a wakeup word carrying task-reconstruction clues back into the same session",
+  "version": "0.4.0",
+  "description": "Model-initiated self-compact + periodic context-gauge injection (PostToolUse hook) for autonomous sessions",
   "author": {
     "name": "RegretSSS"
   },
